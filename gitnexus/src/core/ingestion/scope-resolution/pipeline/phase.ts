@@ -217,7 +217,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         });
       }
 
-      const stats = runScopeResolution(
+      const stats = await runScopeResolution(
         {
           graph: ctx.graph,
           model,

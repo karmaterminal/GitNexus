@@ -45,6 +45,7 @@ import type { ScopeResolver } from '../contract/scope-resolver.js';
 import { findClassBindingInScope, findEnclosingClassDef } from '../scope/walkers.js';
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
 import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
+import { yieldToEventLoop } from '../../utils/event-loop.js';
 
 import { logger } from '../../../logger.js';
 
@@ -195,10 +196,26 @@ interface RunScopeResolutionStats {
   readonly resolutionOutcomes: readonly ResolutionOutcome[];
 }
 
-export function runScopeResolution(
+/**
+ * Cooperative yield cadence for the per-file extract loop, the
+ * resolve-references walk, and the post-resolve emit passes. The
+ * function is otherwise a long synchronous JS computation; without
+ * yields, the event loop is blocked for the entire run and V8 cannot
+ * effectively run incremental GC against a multi-GB working set. See
+ * issue #1741 (large-repo wedge) and the diagnosis in WORKORDER §2.
+ *
+ * The thresholds were picked so that an openclaw-class repo (~16k TS
+ * files, ~5M reference sites) yields ~50-500 times per phase — enough
+ * to (a) let progress events render and (b) give V8 incremental
+ * marking room without measurably penalising small-repo wall-clock
+ * (the per-yield cost is one `setImmediate` round-trip, ~1ms).
+ */
+const SCOPE_YIELD_BATCH_FILES = 256;
+
+export async function runScopeResolution(
   input: RunScopeResolutionInput,
   provider: ScopeResolver,
-): RunScopeResolutionStats {
+): Promise<RunScopeResolutionStats> {
   const { graph, files } = input;
   const onWarn = input.onWarn ?? (() => {});
   const resolutionOutcomes: ResolutionOutcome[] = [];
@@ -257,10 +274,20 @@ export function runScopeResolution(
     ) {
       input.onProgress('extracting', fileIdx + 1, files.length);
     }
+    // Cooperative yield so progress events can render and V8 can run
+    // incremental marking against the parsedFiles heap accumulating in
+    // this frame. Without this, large-repo extract holds the event loop
+    // for the full duration → user-visible "frozen IO + spinning CPU".
+    if ((fileIdx + 1) % SCOPE_YIELD_BATCH_FILES === 0) {
+      await yieldToEventLoop();
+    }
   }
   if (PROF && preExtracted !== undefined) {
     logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
   }
+  // Phase seam: yield before the workspace-owner population hook so the
+  // event loop drains the queue accumulated during the extract walk.
+  await yieldToEventLoop();
   provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
 
   // Reconcile scope-resolution's ownership view into the SemanticModel.
@@ -290,6 +317,10 @@ export function runScopeResolution(
   }
 
   const tExtract = PROF ? process.hrtime.bigint() : 0n;
+  // Phase seam: yield before finalize so the event loop sees a break
+  // between extract's per-file allocation burst and finalize's bulk
+  // index construction.
+  await yieldToEventLoop();
 
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
   input.onProgress?.('analyzing types', files.length, files.length);
@@ -385,6 +416,16 @@ export function runScopeResolution(
   }
   const tPropagate = PROF ? process.hrtime.bigint() : 0n;
 
+  // Release the file-content snapshot now that every populate hook that
+  // could consume it has run. For openclaw-class repos (~16k files) this
+  // recovers ~80 MB at the seam between the populate band and the
+  // resolve/emit band. The downstream passes work off `indexes`,
+  // `parsedFiles`, `referenceIndex`, and `readonlyModel` — none of them
+  // read source text. See #1741 (large-repo wedge).
+  fileContents?.clear();
+  fileContents = undefined;
+  await yieldToEventLoop();
+
   // Opt-in I8 invariant guard. Runs once after all post-finalize hooks
   // (`populateNamespaceSiblings`, `propagateImportedReturnTypes`) have
   // had a chance to drift, so a single sweep covers the full
@@ -398,18 +439,19 @@ export function runScopeResolution(
   const registryProviders: RegistryProviders = {
     arityCompatibility: provider.arityCompatibility,
   };
-  const { referenceIndex, stats: resolveStats } = resolveReferenceSites({
+  const { referenceIndex, stats: resolveStats } = await resolveReferenceSites({
     scopes: indexes,
     providers: registryProviders,
     ownedMembersByOwner: (ownerDefId, memberName) =>
       lookupOwnedMembersByOwner(readonlyModel, ownerDefId, memberName),
   });
   const tResolve = PROF ? process.hrtime.bigint() : 0n;
+  await yieldToEventLoop();
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
   input.onProgress?.('linking symbols', files.length, files.length);
   const handledSites = new Set<string>(preEmittedInheritanceSites);
-  const receiverExtras = emitReceiverBoundCalls(
+  const receiverExtras = await emitReceiverBoundCalls(
     graph,
     indexes,
     parsedFiles,
@@ -422,6 +464,7 @@ export function runScopeResolution(
       recordResolutionOutcome,
     },
   );
+  await yieldToEventLoop();
   const unresolvedReceiverExtras =
     provider.emitUnresolvedReceiverEdges !== undefined
       ? provider.emitUnresolvedReceiverEdges(
@@ -433,7 +476,7 @@ export function runScopeResolution(
           readonlyModel,
         )
       : 0;
-  const freeCallExtras = emitFreeCallFallback(
+  const freeCallExtras = await emitFreeCallFallback(
     graph,
     indexes,
     parsedFiles,
@@ -452,13 +495,15 @@ export function runScopeResolution(
       recordResolutionOutcome,
     },
   );
-  const { emitted, skipped } = emitReferencesViaLookup(
+  await yieldToEventLoop();
+  const { emitted, skipped } = await emitReferencesViaLookup(
     graph,
     indexes,
     referenceIndex,
     postHeritageNodeLookup,
     handledSites,
   );
+  await yieldToEventLoop();
   const importsEmitted = emitImportEdges(
     graph,
     indexes.imports,
