@@ -65,11 +65,11 @@ const validCfg: FunctionCfg = {
 };
 
 /** Run scope-resolution with `pdg: true` over one file carrying `channel`. */
-function emitWith(channel: unknown): KnowledgeGraph {
+async function emitWith(channel: unknown): Promise<KnowledgeGraph> {
   const graph = createKnowledgeGraph();
   const files = [{ path: 'a.py', content: '' }];
   const preExtracted = new Map<string, ParsedFile>([['a.py', mkFile('a.py', channel)]]);
-  runScopeResolution(
+  await runScopeResolution(
     {
       graph,
       model: createSemanticModel(),
@@ -114,57 +114,57 @@ describe('cfgSideChannel emit guard (#2099 F4)', () => {
       .filter((r) => r.level >= 40) // pino warn = 40
       .map((r) => String(r.msg));
 
-  it('a wrong-shape element [{}] is skipped with a warning naming the file; no throw', () => {
-    const graph = emitWith([{}]);
+  it('a wrong-shape element [{}] is skipped with a warning naming the file; no throw', async () => {
+    const graph = await emitWith([{}]);
     expect(basicBlockCount(graph)).toBe(0);
     expect(warns()).toHaveLength(1);
     expect(warns()[0]).toContain('a.py');
   });
 
-  it('a non-array channel is silently skipped by the outer guard', () => {
-    const graph = emitWith('garbage');
+  it('a non-array channel is silently skipped by the outer guard', async () => {
+    const graph = await emitWith('garbage');
     expect(basicBlockCount(graph)).toBe(0);
     expect(warns()).toHaveLength(0);
   });
 
-  it('mixed array: the valid element still emits, the malformed one is skipped (per-element policy)', () => {
-    const graph = emitWith([validCfg, {}]);
+  it('mixed array: the valid element still emits, the malformed one is skipped (per-element policy)', async () => {
+    const graph = await emitWith([validCfg, {}]);
     expect(basicBlockCount(graph)).toBe(2);
     expect(cfgEdges(graph)).toHaveLength(1);
     expect(warns()).toHaveLength(1);
   });
 
-  it('non-integer edge endpoints are rejected by the PREDICATE — zero dangling edge ids (this shape never throws)', () => {
+  it('non-integer edge endpoints are rejected by the PREDICATE — zero dangling edge ids (this shape never throws)', async () => {
     const poisoned = { ...validCfg, edges: [{ from: 'x', to: 1, kind: 'seq' }] };
-    const graph = emitWith([poisoned]);
+    const graph = await emitWith([poisoned]);
     expect(basicBlockCount(graph)).toBe(0);
     expect(cfgEdges(graph)).toHaveLength(0);
     expect(warns()).toHaveLength(1);
   });
 
-  it('an INTEGER endpoint matching no block index is rejected too — membership, not just integer-ness', () => {
+  it('an INTEGER endpoint matching no block index is rejected too — membership, not just integer-ness', async () => {
     const poisoned = { ...validCfg, edges: [{ from: 0, to: 7, kind: 'seq' }] };
-    const graph = emitWith([poisoned]);
+    const graph = await emitWith([poisoned]);
     expect(basicBlockCount(graph)).toBe(0);
     expect(cfgEdges(graph)).toHaveLength(0);
     expect(warns()).toHaveLength(1);
   });
 
-  it('missing id-anchor fields (functionStartColumn) are rejected — prevents first-writer-wins id cross-wiring', () => {
+  it('missing id-anchor fields (functionStartColumn) are rejected — prevents first-writer-wins id cross-wiring', async () => {
     const { functionStartColumn: _drop, ...withoutColumn } = validCfg;
-    const graph = emitWith([withoutColumn]);
+    const graph = await emitWith([withoutColumn]);
     expect(basicBlockCount(graph)).toBe(0);
     expect(warns()).toHaveLength(1);
   });
 
-  it('a null element inside blocks is rejected by the predicate — no partial emit, no orphaned nodes', () => {
+  it('a null element inside blocks is rejected by the predicate — no partial emit, no orphaned nodes', async () => {
     const poisoned = { ...validCfg, blocks: [validCfg.blocks[0], null] };
-    const graph = emitWith([poisoned]);
+    const graph = await emitWith([poisoned]);
     expect(basicBlockCount(graph)).toBe(0); // nothing emitted — not even the valid leading block
     expect(warns()).toHaveLength(1);
   });
 
-  it('backstop: a shape that throws past the predicate (hostile getter) is caught, warned, pass completes', () => {
+  it('backstop: a shape that throws past the predicate (hostile getter) is caught, warned, pass completes', async () => {
     const hostile = {
       ...validCfg,
       blocks: [
@@ -179,13 +179,13 @@ describe('cfgSideChannel emit guard (#2099 F4)', () => {
         },
       ],
     };
-    expect(() => emitWith([hostile])).not.toThrow();
+    await expect(emitWith([hostile])).resolves.toBeTruthy();
     expect(warns()).toHaveLength(1);
     expect(warns()[0]).toContain('CFG emission failed');
   });
 
-  it('a well-formed channel emits blocks + edges identically (regression guard)', () => {
-    const graph = emitWith([validCfg]);
+  it('a well-formed channel emits blocks + edges identically (regression guard)', async () => {
+    const graph = await emitWith([validCfg]);
     expect(basicBlockCount(graph)).toBe(2);
     expect(cfgEdges(graph)).toHaveLength(1);
     expect(warns()).toHaveLength(0);
@@ -241,13 +241,13 @@ describe('#2082 M2 — statement-fact emit guard (isEmitSafeCfg extension)', () 
     ],
   });
 
-  it('a well-formed facts-bearing CFG passes the guard and emits REACHING_DEF', () => {
-    const graph = emitWith([factCfg()]);
+  it('a well-formed facts-bearing CFG passes the guard and emits REACHING_DEF', async () => {
+    const graph = await emitWith([factCfg()]);
     expect(rdEdges(graph)).toBeGreaterThan(0);
     expect(warns()).toHaveLength(0);
   });
 
-  it('an OUT-OF-RANGE binding index is rejected per element (would template undefined into ids)', () => {
+  it('an OUT-OF-RANGE binding index is rejected per element (would template undefined into ids)', async () => {
     const bad = factCfg([
       { index: 0, startLine: 1, endLine: 1, text: '', kind: 'entry', statements: [] },
       {
@@ -259,24 +259,24 @@ describe('#2082 M2 — statement-fact emit guard (isEmitSafeCfg extension)', () 
         statements: [{ line: 2, defs: [7], uses: [0] }], // 7 escapes the 1-entry table
       },
     ]);
-    const graph = emitWith([bad, validCfg]);
+    const graph = await emitWith([bad, validCfg]);
     // the malformed element is skipped with a warn; the valid sibling emits CFG
     expect(rdEdges(graph)).toBe(0);
     expect(cfgEdgeCount(graph)).toBeGreaterThan(0);
     expect(warns().some((m) => m.includes('malformed'))).toBe(true);
   });
 
-  it('statements WITHOUT a binding table are rejected (malformed by construction)', () => {
+  it('statements WITHOUT a binding table are rejected (malformed by construction)', async () => {
     const noTable = {
       ...(factCfg() as Record<string, unknown>),
       bindings: undefined,
     };
-    const graph = emitWith([noTable]);
+    const graph = await emitWith([noTable]);
     expect(rdEdges(graph)).toBe(0);
     expect(warns().some((m) => m.includes('malformed'))).toBe(true);
   });
 
-  it('non-integer statement line / non-array defs are rejected per element', () => {
+  it('non-integer statement line / non-array defs are rejected per element', async () => {
     const badLine = factCfg([
       {
         index: 0,
@@ -300,14 +300,14 @@ describe('#2082 M2 — statement-fact emit guard (isEmitSafeCfg extension)', () 
       { index: 1, startLine: 3, endLine: 3, text: '', kind: 'exit', statements: [] },
     ]);
     for (const bad of [badLine, badDefs]) {
-      const graph = emitWith([bad]);
+      const graph = await emitWith([bad]);
       expect(rdEdges(graph)).toBe(0);
     }
     expect(warns().some((m) => m.includes('malformed'))).toBe(true);
   });
 
-  it('a pre-M2 channel (no bindings, no statements) still passes — CFG emits, REACHING_DEF skips', () => {
-    const graph = emitWith([validCfg]);
+  it('a pre-M2 channel (no bindings, no statements) still passes — CFG emits, REACHING_DEF skips', async () => {
+    const graph = await emitWith([validCfg]);
     expect(cfgEdgeCount(graph)).toBeGreaterThan(0);
     expect(rdEdges(graph)).toBe(0);
     expect(warns()).toHaveLength(0);
@@ -315,11 +315,11 @@ describe('#2082 M2 — statement-fact emit guard (isEmitSafeCfg extension)', () 
 });
 
 describe('#2160 review — entry/exit index validation', () => {
-  it('an out-of-range entryIndex is rejected per element (would crash the solver mid-file)', () => {
+  it('an out-of-range entryIndex is rejected per element (would crash the solver mid-file)', async () => {
     const bad = { ...validCfg, entryIndex: 99 };
     const logs = _captureLogger();
     try {
-      const graph = emitWith([bad, validCfg]);
+      const graph = await emitWith([bad, validCfg]);
       // the malformed element is skipped; the valid sibling still emits
       let cfgEdges = 0;
       graph.forEachRelationship((r) => {

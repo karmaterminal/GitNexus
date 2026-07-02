@@ -252,7 +252,6 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         ? buildFunctionNodeIndex(ctx.graph)
         : undefined;
 
-
     // Streaming/chunked PDG emit (#2202): when enabled (the caller has already
     // gated this to full-rebuild + `--pdg`), route the BasicBlock + intra-file
     // PDG-edge layer to CSV-on-disk through one sink shared across every
