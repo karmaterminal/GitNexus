@@ -94,7 +94,7 @@ function makeIndexes(
 }
 
 describe('resolveReferenceSites', () => {
-  it('uses ownedMembersByOwner to resolve a hook-provided receiver member', () => {
+  it('uses ownedMembersByOwner to resolve a hook-provided receiver member', async () => {
     const userClass = mkDef({ nodeId: 'def:User', type: 'Class', qualifiedName: 'User' });
     const saveMethod = mkDef({
       nodeId: 'def:User.save',
@@ -117,7 +117,7 @@ describe('resolveReferenceSites', () => {
     };
     const indexes = makeIndexes([scope], [userClass], [referenceSite]);
 
-    const result = resolveReferenceSites({
+    const result = await resolveReferenceSites({
       scopes: indexes,
       ownedMembersByOwner: (ownerDefId, memberName) =>
         ownerDefId === 'def:User' && memberName === 'save' ? [saveMethod] : [],
@@ -128,7 +128,7 @@ describe('resolveReferenceSites', () => {
     expect(result.referenceIndex.bySourceScope.get('scope:call')?.[0]?.toDef).toBe('def:User.save');
   });
 
-  it('threads providers.arityCompatibility through to filter hook-provided overloads', () => {
+  it('threads providers.arityCompatibility through to filter hook-provided overloads', async () => {
     const userClass = mkDef({ nodeId: 'def:User', type: 'Class', qualifiedName: 'User' });
     const saveOne = mkDef({
       nodeId: 'def:User.save#1',
@@ -159,7 +159,7 @@ describe('resolveReferenceSites', () => {
     };
     const indexes = makeIndexes([scope], [userClass], [referenceSite]);
 
-    const result = resolveReferenceSites({
+    const result = await resolveReferenceSites({
       scopes: indexes,
       ownedMembersByOwner: (ownerDefId, memberName) =>
         ownerDefId === 'def:User' && memberName === 'save' ? [saveOne, saveTwo] : [],

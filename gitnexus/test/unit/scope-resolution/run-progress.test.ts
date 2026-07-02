@@ -41,7 +41,7 @@ const stubProvider = {
 } as unknown as ScopeResolver;
 
 describe('runScopeResolution onProgress', () => {
-  it('emits sub-phases in order for a 3-file input', () => {
+  it('emits sub-phases in order for a 3-file input', async () => {
     const files = [
       { path: 'a.py', content: '' },
       { path: 'b.py', content: '' },
@@ -55,7 +55,7 @@ describe('runScopeResolution onProgress', () => {
       calls.push({ subPhase, current, total });
     };
 
-    runScopeResolution(
+    await runScopeResolution(
       {
         graph: createKnowledgeGraph(),
         model: createSemanticModel(),
@@ -85,13 +85,13 @@ describe('runScopeResolution onProgress', () => {
     expect(resolveIdx).toBeLessThan(linkIdx);
   });
 
-  it('emits only extracting (0, 0) then returns early for 0-file input', () => {
+  it('emits only extracting (0, 0) then returns early for 0-file input', async () => {
     const calls: { subPhase: ScopeResolutionSubPhase; current: number; total: number }[] = [];
     const onProgress = (subPhase: ScopeResolutionSubPhase, current: number, total: number) => {
       calls.push({ subPhase, current, total });
     };
 
-    const stats = runScopeResolution(
+    const stats = await runScopeResolution(
       {
         graph: createKnowledgeGraph(),
         model: createSemanticModel(),

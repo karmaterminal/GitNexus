@@ -106,14 +106,14 @@ async function main() {
   // Warmup
   for (let i = 0; i < 2; i++) {
     const graph = buildGraph(files);
-    runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
+    await runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
   }
 
   const samples: number[] = [];
   for (let i = 0; i < ITERS; i++) {
     const graph = buildGraph(files);
     const start = process.hrtime.bigint();
-    runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
+    await runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
     const end = process.hrtime.bigint();
     const ms = Number(end - start) / 1_000_000;
     samples.push(ms);

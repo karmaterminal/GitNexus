@@ -46,8 +46,16 @@ import {
   narrowOverloadCandidates,
   type ConversionRankFn,
 } from './overload-narrowing.js';
+import { yieldToEventLoop } from '../../utils/event-loop.js';
 
-export function emitFreeCallFallback(
+/**
+ * Cooperative yield cadence for the per-file free-call walk. Same
+ * shape as {@link emitReceiverBoundCalls} — yield every N files (not
+ * sites) to bound per-yield overhead at large-repo scale. See #1741.
+ */
+const EMIT_FREECALL_YIELD_BATCH_FILES = 64;
+
+export async function emitFreeCallFallback(
   graph: KnowledgeGraph,
   scopes: ScopeResolutionIndexes,
   parsedFiles: readonly ParsedFile[],
@@ -89,7 +97,7 @@ export function emitFreeCallFallback(
     readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
   } = {},
-): number {
+): Promise<number> {
   let emitted = 0;
   const seen = new Set<string>();
 
@@ -113,6 +121,7 @@ export function emitFreeCallFallback(
       ? new Map<string, readonly SymbolDefinition[]>()
       : undefined;
 
+  let filesProcessedSinceYield = 0;
   for (const parsed of parsedFiles) {
     for (const site of parsed.referenceSites) {
       if (site.kind !== 'call') continue;
@@ -436,6 +445,11 @@ export function emitFreeCallFallback(
         reason: fnDef.filePath !== parsed.filePath ? 'import-resolved' : 'local-call',
       });
       emitted++;
+    }
+    filesProcessedSinceYield++;
+    if (filesProcessedSinceYield >= EMIT_FREECALL_YIELD_BATCH_FILES) {
+      filesProcessedSinceYield = 0;
+      await yieldToEventLoop();
     }
   }
   return emitted;

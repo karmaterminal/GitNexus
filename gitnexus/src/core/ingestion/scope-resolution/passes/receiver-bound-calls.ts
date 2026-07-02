@@ -61,6 +61,14 @@ import {
   narrowOverloadCandidates,
   isOverloadAmbiguousAfterNormalization,
 } from './overload-narrowing.js';
+import { yieldToEventLoop } from '../../utils/event-loop.js';
+
+/**
+ * Cooperative yield cadence for the per-file emit walk. Yields every
+ * N files (not every site) because per-file cost is variable and a
+ * per-site yield adds too much wall-clock overhead. See #1741.
+ */
+const EMIT_RECEIVER_YIELD_BATCH_FILES = 64;
 import {
   extractTemplateArguments,
   stripTemplateArguments,
@@ -137,7 +145,7 @@ function resolveClassBindingForName(
   return findClassBindingInScope(scopeId, baseName, scopes);
 }
 
-export function emitReceiverBoundCalls(
+export async function emitReceiverBoundCalls(
   graph: KnowledgeGraph,
   scopes: ScopeResolutionIndexes,
   parsedFiles: readonly ParsedFile[],
@@ -149,7 +157,7 @@ export function emitReceiverBoundCalls(
   options: {
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
   } = {},
-): number {
+): Promise<number> {
   let emitted = 0;
   // Per-pass dedup so the multiple cases don't double-emit if two of
   // them resolve the same site to the same target. NEVER pre-seed
@@ -231,6 +239,7 @@ export function emitReceiverBoundCalls(
     return n;
   };
 
+  let filesEmittedSinceYield = 0;
   for (const parsed of parsedFiles) {
     const namespaceTargets = collectNamespaceTargets(parsed, scopes);
 
@@ -1248,6 +1257,11 @@ export function emitReceiverBoundCalls(
           continue;
         }
       }
+    }
+    filesEmittedSinceYield++;
+    if (filesEmittedSinceYield >= EMIT_RECEIVER_YIELD_BATCH_FILES) {
+      filesEmittedSinceYield = 0;
+      await yieldToEventLoop();
     }
   }
 

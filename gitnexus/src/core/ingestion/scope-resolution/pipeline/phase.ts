@@ -252,6 +252,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         ? buildFunctionNodeIndex(ctx.graph)
         : undefined;
 
+
     // Streaming/chunked PDG emit (#2202): when enabled (the caller has already
     // gated this to full-rebuild + `--pdg`), route the BasicBlock + intra-file
     // PDG-edge layer to CSV-on-disk through one sink shared across every
@@ -277,6 +278,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
         );
       }
     }
+
     // Cross-pass per-file dedup set for the streaming sink (#2202): one set
     // shared across every language pass so a file emitted in two passes (e.g. a
     // `.ts` module pulled into the Vue context pass) streams its PDG layer once.
@@ -410,7 +412,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
           });
         }
 
-        const stats = runScopeResolution(
+        const stats = await runScopeResolution(
           {
             graph: ctx.graph,
             model,

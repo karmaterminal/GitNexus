@@ -24,6 +24,14 @@ import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexe
 import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
 import { mapReferenceKindToEdgeType } from '../graph-bridge/edges.js';
 import type { GraphNodeLookup } from '../graph-bridge/node-lookup.js';
+import { yieldToEventLoop } from '../../utils/event-loop.js';
+
+/**
+ * Cooperative yield cadence for the per-reference emit walk. The total
+ * reference count tracks `resolveReferenceSites`'s scale (millions on
+ * openclaw-class repos). See #1741.
+ */
+const EMIT_YIELD_BATCH_REFS = 10_000;
 
 /**
  * Optional opaque skip key — providers may pre-emit edges (e.g. via
@@ -34,27 +42,34 @@ import type { GraphNodeLookup } from '../graph-bridge/node-lookup.js';
  */
 type ReferenceSiteSkipSet = ReadonlySet<string>;
 
-export function emitReferencesViaLookup(
+export async function emitReferencesViaLookup(
   graph: KnowledgeGraph,
   scopes: ScopeResolutionIndexes,
   referenceIndex: { readonly bySourceScope: ReadonlyMap<ScopeId, readonly Reference[]> },
   nodeLookup: GraphNodeLookup,
   skipSites?: ReferenceSiteSkipSet,
-): { emitted: number; skipped: number } {
+): Promise<{ emitted: number; skipped: number }> {
   let emitted = 0;
   let skipped = 0;
+  let refsSeen = 0;
   const seen = new Set<string>();
 
   for (const [fromScope, refs] of referenceIndex.bySourceScope) {
     const callerGraphId = resolveCallerGraphId(fromScope, scopes, nodeLookup);
     if (callerGraphId === undefined) {
       skipped += refs.length;
+      refsSeen += refs.length;
+      if (refsSeen >= EMIT_YIELD_BATCH_REFS) {
+        refsSeen = 0;
+        await yieldToEventLoop();
+      }
       continue;
     }
     const fromScopeMeta = scopes.scopeTree.getScope(fromScope);
     const fromFilePath = fromScopeMeta?.filePath;
 
     for (const ref of refs) {
+      refsSeen++;
       if (skipSites !== undefined && fromFilePath !== undefined) {
         const siteKey = `${fromFilePath}:${ref.atRange.startLine}:${ref.atRange.startCol}`;
         if (skipSites.has(siteKey)) {
@@ -93,6 +108,10 @@ export function emitReferencesViaLookup(
         reason: `scope-resolution: ${ref.kind}`,
       });
       emitted++;
+    }
+    if (refsSeen >= EMIT_YIELD_BATCH_REFS) {
+      refsSeen = 0;
+      await yieldToEventLoop();
     }
   }
   return { emitted, skipped };

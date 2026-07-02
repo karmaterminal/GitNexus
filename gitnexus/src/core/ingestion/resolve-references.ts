@@ -59,8 +59,19 @@ import {
   type ScopeId,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { yieldToEventLoop } from './utils/event-loop.js';
 
 // ─── Public API ─────────────────────────────────────────────────────────────
+
+/**
+ * Cooperative yield cadence for the reference-site walk. The site array
+ * is O(reference-sites-across-workspace), which for openclaw-class
+ * monorepos (~16k TS files) is in the 5-10M range. Without cooperative
+ * yields the walk runs as a single synchronous block — blocking the
+ * event loop and preventing V8 from running incremental marking against
+ * the resolution working set. See #1741.
+ */
+const RESOLVE_YIELD_BATCH_SITES = 10_000;
 
 export interface ResolveReferencesInput {
   readonly scopes: ScopeResolutionIndexes;
@@ -86,8 +97,16 @@ export interface ResolveReferencesOutput {
  * Resolve every `ReferenceSite` in `scopes.referenceSites` against the
  * matching registry and produce a `ReferenceIndex` keyed by source scope
  * + target def.
+ *
+ * Cooperative: yields to the event loop every
+ * {@link RESOLVE_YIELD_BATCH_SITES} sites so progress events can render
+ * and V8 can run incremental mark-compact against the indexes accumulating
+ * in this frame. Yield cost is one `setImmediate` round-trip per batch;
+ * for a small-repo case (e.g. ~1k sites) it adds at most one yield.
  */
-export function resolveReferenceSites(input: ResolveReferencesInput): ResolveReferencesOutput {
+export async function resolveReferenceSites(
+  input: ResolveReferencesInput,
+): Promise<ResolveReferencesOutput> {
   const { scopes } = input;
   const providers: RegistryProviders = input.providers ?? {};
 
@@ -126,26 +145,29 @@ export function resolveReferenceSites(input: ResolveReferencesInput): ResolveRef
     );
     if (resolutions.length === 0) {
       unresolved++;
-      continue;
+    } else {
+      const top = resolutions[0]!;
+      const ref = buildReference(site, top);
+      referencesEmitted++;
+
+      let bySource = bySourceScope.get(site.inScope);
+      if (bySource === undefined) {
+        bySource = [];
+        bySourceScope.set(site.inScope, bySource);
+      }
+      bySource.push(ref);
+
+      let byTarget = byTargetDef.get(top.def.nodeId);
+      if (byTarget === undefined) {
+        byTarget = [];
+        byTargetDef.set(top.def.nodeId, byTarget);
+      }
+      byTarget.push(ref);
     }
 
-    const top = resolutions[0]!;
-    const ref = buildReference(site, top);
-    referencesEmitted++;
-
-    let bySource = bySourceScope.get(site.inScope);
-    if (bySource === undefined) {
-      bySource = [];
-      bySourceScope.set(site.inScope, bySource);
+    if (sitesProcessed % RESOLVE_YIELD_BATCH_SITES === 0) {
+      await yieldToEventLoop();
     }
-    bySource.push(ref);
-
-    let byTarget = byTargetDef.get(top.def.nodeId);
-    if (byTarget === undefined) {
-      byTarget = [];
-      byTargetDef.set(top.def.nodeId, byTarget);
-    }
-    byTarget.push(ref);
   }
 
   // Freeze inner arrays so consumers don't accidentally mutate.
