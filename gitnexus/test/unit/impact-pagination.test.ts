@@ -46,30 +46,40 @@ function makeBackend() {
   return { backend, repoHandle };
 }
 
+// The BFS frontier query is now parameterized (bound $frontierIds/$relTypes,
+// #1907 U3), so the caller rows come back through executeParameterizedMock
+// (matched on `r.type IN`) rather than executeQueryMock. Symbol resolution and
+// the label-enrichment UNION still fall through to the default symbol row.
 function setupMultiDepthHub(d1Count: number, d2Count: number) {
   let depth = 0;
   executeParameterizedMock.mockImplementation(async (...args: any[]) => {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
+    // The #1858 epistemic-boundary probe (computeEpistemicBoundary) runs
+    // concurrently with the BFS and also matches `r.type IN`, but targets the
+    // `iface` alias. Return empty so it stays `epistemic: 'exact'` and does not
+    // consume a depth slot from the frontier counter below.
+    if (query.includes('iface')) return [];
+    if (query.includes('r.type IN')) {
+      depth++;
+      const count = depth === 1 ? d1Count : depth === 2 ? d2Count : 0;
+      const res: any[] = [];
+      for (let i = 0; i < count; i++) {
+        res.push({
+          id: `d${depth}-caller-${i}`,
+          name: `d${depth}caller${i}`,
+          filePath: `src/d${depth}-caller-${i}.ts`,
+          relType: 'CALLS',
+          confidence: null,
+        });
+      }
+      return res;
+    }
     return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
   });
 
-  executeQueryMock.mockImplementation(async () => {
-    depth++;
-    const count = depth === 1 ? d1Count : depth === 2 ? d2Count : 0;
-    const res: any[] = [];
-    for (let i = 0; i < count; i++) {
-      res.push({
-        id: `d${depth}-caller-${i}`,
-        name: `d${depth}caller${i}`,
-        filePath: `src/d${depth}-caller-${i}.ts`,
-        relType: 'CALLS',
-        confidence: null,
-      });
-    }
-    return res;
-  });
+  executeQueryMock.mockImplementation(async () => []);
 }
 
 function setupHubSymbol(count: number) {
@@ -77,12 +87,10 @@ function setupHubSymbol(count: number) {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
-    return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
-  });
-
-  executeQueryMock.mockImplementation(async (...args: any[]) => {
-    const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
-    if (query.includes('r.type IN') && !query.includes('STEP_IN_PROCESS')) {
+    // See setupMultiDepthHub — keep the #1858 epistemic probe from matching the
+    // `r.type IN` caller branch below.
+    if (query.includes('iface')) return [];
+    if (query.includes('r.type IN')) {
       const res: any[] = [];
       for (let i = 0; i < count; i++) {
         res.push({
@@ -95,8 +103,10 @@ function setupHubSymbol(count: number) {
       }
       return res;
     }
-    return [];
+    return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
   });
+
+  executeQueryMock.mockImplementation(async () => []);
 }
 
 describe('impact: pagination and summaryOnly (#414)', () => {

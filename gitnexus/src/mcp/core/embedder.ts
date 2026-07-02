@@ -5,7 +5,11 @@
  * For MCP, we only need to compute query embeddings, not batch embed.
  */
 
-import { pipeline, env, type FeatureExtractionPipeline } from '@huggingface/transformers';
+// Type-only import: erased at compile time so loading this module never pulls
+// in @huggingface/transformers (and its native onnxruntime-node binding) at
+// runtime. The runtime values (pipeline, env) are dynamically imported inside
+// initEmbedder, after the platform guard has passed (#1515).
+import type { FeatureExtractionPipeline } from '@huggingface/transformers';
 import {
   isHttpMode,
   getHttpDimensions,
@@ -17,6 +21,8 @@ import {
   isHfDownloadFailure,
   withHfDownloadRetry,
 } from '../../core/embeddings/hf-env.js';
+import { getLocalEmbeddingRuntimeBlocker } from '../../core/embeddings/runtime-support.js';
+import { ensureOnnxRuntimeCommonResolvable } from '../../core/embeddings/onnxruntime-common-resolver.js';
 import { silenceStdout, restoreStdout, realStderrWrite } from '../../core/lbug/pool-adapter.js';
 
 import { logger } from '../../core/logger.js';
@@ -36,6 +42,16 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
     throw new Error('initEmbedder() should not be called in HTTP mode.');
   }
 
+  // Fail fast on platforms where the bundled native ONNX Runtime binding is not
+  // shipped (macOS Intel, #1515). Must run before any transformers.js /
+  // onnxruntime-node import or resolution — otherwise the native module load
+  // crashes with a raw "Cannot find module ...onnxruntime_binding.node" that
+  // ONNX_WEB_BACKEND=wasm cannot rescue (#1516).
+  const runtimeBlocker = getLocalEmbeddingRuntimeBlocker();
+  if (runtimeBlocker) {
+    throw new Error(runtimeBlocker);
+  }
+
   if (embedderInstance) {
     return embedderInstance;
   }
@@ -48,6 +64,13 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
 
   initPromise = (async () => {
     try {
+      // Lazy-load transformers.js only after the runtime guard has passed, so
+      // unsupported platforms never reach the native ONNX import (#1515).
+      // Under pnpm-strict / `pnpm dlx`, transformers' phantom `onnxruntime-common`
+      // import is unresolvable; register the fallback resolver first (#307).
+      ensureOnnxRuntimeCommonResolvable();
+      const { pipeline, env } = await import('@huggingface/transformers');
+
       env.allowLocalModels = false;
       // Bridge user-controlled env vars to transformers.js: HF_HOME →
       // env.cacheDir, HF_ENDPOINT → env.remoteHost (#1205). Centralised in

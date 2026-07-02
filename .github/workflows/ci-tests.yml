@@ -12,7 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # persist-credentials: false — this job runs tests and uploads a
+      # test-reports artifact (if: always()). The default-persisted token in
+      # .git/config must not be capturable through that upload (zizmor
+      # credential-persistence / artipacked audit). The job never pushes.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-gitnexus
         with:
           build: 'true'
@@ -72,12 +78,45 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # persist-credentials: false — runs tests only, never pushes (zizmor
+      # credential-persistence / artipacked audit).
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-gitnexus
         with:
           build: 'true'
       - name: Run platform-sensitive tests
         run: npx tsx scripts/run-cross-platform.ts
+        working-directory: gitnexus
+
+  # Tree-sitter ABI gate (#1922). Two halves, both blocking:
+  #   1. Static, offline: assert every grammar's compiled ABI loads on the
+  #      pinned runtime (check-tree-sitter-upgrade-readiness.py --assert-current).
+  #   2. Dynamic: run the parser-loader ABI load-smoke on the OS matrix so an
+  #      ABI-incompatible committed vendor prebuilt (e.g. Swift's — the static
+  #      check introspects source, not the shipped .node) fails on the platform
+  #      it ships to.
+  abi-assert:
+    name: tree-sitter ABI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+
+      - name: Assert installed + vendored grammar ABIs (static)
+        shell: bash
+        run: python3 .github/scripts/check-tree-sitter-upgrade-readiness.py --assert-current
+
+      - name: Run parser-loader ABI load-smoke (dynamic)
+        run: npx vitest run test/unit/parser-loader-abi.test.ts
         working-directory: gitnexus
 
   # End-to-end smoke test for the #1728 packaging fix: pack the published
@@ -99,7 +138,7 @@ jobs:
       # from a tarball and never pushes back; the token in .git/config would
       # be at risk of leaking through any future artifact-upload step
       # (zizmor artipacked audit). Disable upfront.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-gitnexus
@@ -181,3 +220,88 @@ jobs:
           else
             "$PREFIX/bin/gitnexus" --version
           fi
+
+  # ── Dedicated benchmark gate ─────────────────────────────────────
+  # The cross-language `*-pipeline-benchmark.test.ts` suites are gated behind
+  # GITNEXUS_BENCH (they generate synthetic codebases at scale), so the main
+  # coverage job above SKIPS them — their O(n^2) scaling guards never ran in CI.
+  # Run them here with GITNEXUS_BENCH=1, alongside the Python scope-capture and
+  # import-resolution fingerprint + scaling guards (PR #1918 P2a).
+  #
+  # `--no-file-parallelism` is REQUIRED: these suites measure wall-clock and peak
+  # heap, so parallel forks both skew the timings and OOM the worker pool — they
+  # must run one file at a time.
+  #
+  # go-pipeline-benchmark.test.ts is deliberately NOT included: its
+  # worker-pool (#1848) suite spins a real worker pool that exits unexpectedly
+  # under vitest's fork pool (reproduced in validation), which would make this
+  # gate flaky. Go is already guarded by its non-gated O(n^2) tripwire (runs in
+  # the main coverage job) plus its golden capture-parity test.
+  benchmarks:
+    name: benchmarks (GITNEXUS_BENCH)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # persist-credentials: false — this job only runs npm + vitest benchmarks
+      # and never pushes; the default-persisted token in .git/config would be at
+      # risk of leaking through an artifact upload (zizmor credential-persistence
+      # / artipacked audit). Mirrors the packaged-install-smoke job below.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+
+      - name: Python scope-capture + import-resolution fingerprint / scaling guards
+        run: |
+          node --import tsx bench/python-scope/measure.mjs --check
+          node --import tsx bench/python-scope/import-target-fingerprint.mjs --check
+        working-directory: gitnexus
+
+      - name: Cross-language scope-capture fingerprint + scaling guards
+        # Build-free: asserts emit<Lang>ScopeCaptures output is unchanged
+        # (fingerprint) and stays linear (scaling < 1.5) for go/csharp/rust/php/
+        # ruby/cobol. Catches an O(n^2) re-regression without the worker pool.
+        run: node --import tsx bench/scope-capture/measure.mjs --check
+        working-directory: gitnexus
+
+      - name: CFG construction time / disk / memory guards (#2081 M1)
+        # Build-free: asserts collectFunctionCfgs output is unchanged
+        # (fingerprint) and that wall-time, cfgSideChannel disk bytes, AND
+        # retained heap all stay sub-quadratic for the straight-line /
+        # many-functions / branchy scenarios. Catches an O(n^2) re-regression in
+        # the per-function CFG builder (e.g. an extendBlock concat chain) and a
+        # memory/disk blow-up. --expose-gc enables the retained-heap measurement.
+        run: node --expose-gc --import tsx bench/cfg/measure.mjs --check
+        working-directory: gitnexus
+
+      - name: Emit-persistence throughput / byte-identity guards (#2203)
+        # Build-free: asserts streamAllCSVsToDisk output is byte-identical
+        # (order-independent CSV-line fingerprint — the #2203 U2/U3 emit
+        # optimisations must not change graph content) and that emit wall-time
+        # stays linear in node+edge count. The LadybugDB COPY half needs a real
+        # DB, so its timing lives in the runtime PROF_LBUG_LOAD breakdown.
+        run: node --import tsx bench/emit-persistence/measure.mjs --check
+        working-directory: gitnexus
+
+      - name: Streaming PDG-emit byte-identity / bounded-RSS guards (#2202)
+        # Build-free: asserts the streaming PdgEmitSink emits a CSV row SET
+        # byte-identical to the whole-graph streamAllCSVsToDisk emit, AND that
+        # the in-memory graph retains zero BasicBlock nodes (the O(chunk) peak-RSS
+        # bound that unblocks full-kernel-scale repos). Fails on fingerprint drift
+        # or any resident BasicBlock.
+        run: node --import tsx bench/emit-persistence/measure-streaming.mjs --check
+        working-directory: gitnexus
+
+      - name: Cross-language pipeline benchmarks (GITNEXUS_BENCH, serial)
+        env:
+          GITNEXUS_BENCH: '1'
+        run: >-
+          npx vitest run --no-file-parallelism
+          test/integration/cobol-pipeline-benchmark.test.ts
+          test/integration/csharp-pipeline-benchmark.test.ts
+          test/integration/rust-pipeline-benchmark.test.ts
+          test/integration/php-pipeline-benchmark.test.ts
+          test/integration/ruby-pipeline-benchmark.test.ts
+        working-directory: gitnexus

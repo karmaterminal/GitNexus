@@ -149,6 +149,14 @@ describe('CLI help surface', () => {
     expect(result.stdout).not.toContain('Target repository (omit if only one indexed)');
   });
 
+  it('setup help exposes selective coding-agent configuration', () => {
+    const result = runHelp('setup');
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('gitnexus setup [options]');
+    expect(result.stdout).toContain('-c, --coding-agent <agents>');
+  });
+
   it('localizes every registered CLI command and option description in zh-CN help', () => {
     const zhHelpOutput = allHelpCommands
       .map((args) => {
@@ -196,13 +204,18 @@ describe('CLI help surface', () => {
     expect(result.stdout).toContain('--file <path>');
   });
 
-  it('impact help keeps repo and include-tests flags', () => {
+  it('impact help keeps repo, include-tests, and disambiguation flags', () => {
     const result = runHelp('impact');
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('--depth <n>');
     expect(result.stdout).toContain('--include-tests');
     expect(result.stdout).toContain('--repo <name>');
+    // Disambiguation flags (#1907) — mirror the context help test so a
+    // missing-flag regression on impact is caught here too.
+    expect(result.stdout).toContain('--uid <uid>');
+    expect(result.stdout).toContain('--file <path>');
+    expect(result.stdout).toContain('--kind <kind>');
   });
 
   it('detect-changes help exposes compare scope and base-ref flags', () => {
@@ -213,6 +226,14 @@ describe('CLI help surface', () => {
     expect(result.stdout).toContain('--scope <scope>');
     expect(result.stdout).toContain('--base-ref <ref>');
     expect(result.stdout).toContain('--repo <name>');
+  });
+
+  it('query-family commands expose the --branch scope flag (#2106)', () => {
+    for (const cmd of ['query', 'context', 'impact', 'cypher', 'detect-changes']) {
+      const result = runHelp(cmd);
+      expect(result.status, cmd).toBe(0);
+      expect(result.stdout, cmd).toContain('--branch <name>');
+    }
   });
 
   it('wiki help shows provider, review, and verbose flags', () => {

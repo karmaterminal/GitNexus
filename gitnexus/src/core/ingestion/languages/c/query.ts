@@ -1,5 +1,15 @@
 import Parser from 'tree-sitter';
-import C from 'tree-sitter-c';
+import { SupportedLanguages } from 'gitnexus-shared';
+// `tree-sitter-c` is vendored prebuild-only (#2116) and may be absent on a
+// toolchain-less / `--ignore-scripts` install. It is loaded lazily + guarded via
+// parser-loader rather than statically imported: this module is pulled onto the
+// main thread eagerly by the scope-resolution registry and the language-provider
+// index, so a top-level `import C from 'tree-sitter-c'` would throw
+// ERR_MODULE_NOT_FOUND at module-load and crash `analyze` even for repos with no
+// C files (#2091, #2093). The grammar is only ever needed inside the lazy getters
+// below, and the main-thread `isLanguageAvailable` filter ensures they are
+// reached only when the binding is present.
+import { getLanguageGrammar } from '../../../tree-sitter/parser-loader.js';
 
 const C_SCOPE_QUERY = `
 ;; Scopes
@@ -40,6 +50,12 @@ const C_SCOPE_QUERY = `
 ;; Declarations — enum
 (enum_specifier
   name: (type_identifier) @declaration.name) @declaration.enum
+
+;; Declarations — enum (typedef enum { ... } Name)
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @declaration.name) @declaration.enum
 
 ;; Declarations — function definition
 (function_definition
@@ -91,6 +107,15 @@ const C_SCOPE_QUERY = `
 ;; Declarations — variables (with initializer)
 (declaration
   declarator: (init_declarator
+    declarator: (identifier) @declaration.name)) @declaration.variable
+
+;; Declarations — variables (without initializer), including non-leading
+;; declarators in mixed declaration lists.
+(declaration
+  declarator: (identifier) @declaration.name) @declaration.variable
+
+(declaration
+  declarator: (pointer_declarator
     declarator: (identifier) @declaration.name)) @declaration.variable
 
 ;; Declarations — macro definitions
@@ -152,14 +177,19 @@ let _query: Parser.Query | null = null;
 export function getCParser(): Parser {
   if (_parser === null) {
     _parser = new Parser();
-    _parser.setLanguage(C as Parameters<Parser['setLanguage']>[0]);
+    _parser.setLanguage(
+      getLanguageGrammar(SupportedLanguages.C) as Parameters<Parser['setLanguage']>[0],
+    );
   }
   return _parser;
 }
 
 export function getCScopeQuery(): Parser.Query {
   if (_query === null) {
-    _query = new Parser.Query(C as Parameters<Parser['setLanguage']>[0], C_SCOPE_QUERY);
+    _query = new Parser.Query(
+      getLanguageGrammar(SupportedLanguages.C) as Parameters<Parser['setLanguage']>[0],
+      C_SCOPE_QUERY,
+    );
   }
   return _query;
 }

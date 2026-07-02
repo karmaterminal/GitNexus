@@ -4,19 +4,21 @@ import { createInterface } from 'readline';
 import { once } from 'events';
 import { finished } from 'stream/promises';
 import path from 'path';
-import os from 'os';
-import crypto from 'crypto';
 import lbug from '@ladybugdb/core';
+import { closeQueryResults } from './query-result-utils.js';
 import { KnowledgeGraph } from '../graph/types.js';
 import {
   NODE_TABLES,
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
+  CREATE_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
   NodeTableName,
 } from './schema.js';
-import { streamAllCSVsToDisk } from './csv-generator.js';
+import { streamAllCSVsToDisk, type StreamedCSVResult } from './csv-generator.js';
+import type { PdgEmitManifest } from './pdg-emit-sink.js';
+import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import type { CachedEmbedding } from '../embeddings/types.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
@@ -26,6 +28,7 @@ import {
   isWalCorruptionError,
   openLbugConnection,
   toNativeSafePath,
+  resolveNativeSafeStorageDir,
   WAL_RECOVERY_SUGGESTION,
   waitForWindowsHandleRelease,
   type LbugConnectionHandle,
@@ -46,9 +49,9 @@ import { logger } from '../logger.js';
 // ---------------------------------------------------------------------------
 // Relationship CSV splitting — extracted for testability (PR #818)
 // ---------------------------------------------------------------------------
-
-/** Factory for creating WriteStreams — injectable for testing. */
-export type WriteStreamFactory = (filePath: string) => import('fs').WriteStream;
+// WriteStreamFactory is imported above from rel-pair-routing.ts (its canonical
+// home) for splitRelCsvByLabelPair's signature; no external code imports it from
+// here, so it is not re-exported.
 
 /** Result of splitting the relationship CSV into per-label-pair files. */
 export interface RelCsvSplitResult {
@@ -61,6 +64,15 @@ export interface RelCsvSplitResult {
 
 /**
  * Split a relationship CSV into per-label-pair files on disk.
+ *
+ * @internal RETAINED AS A DIFFERENTIAL ORACLE. As of #2203 U2, production emit
+ * routes relationships to per-pair files directly during the single pass (see
+ * RelPairRouter in `rel-pair-routing.ts`), so this function has NO production
+ * callers — it is kept ONLY so the byte-identity test in
+ * `test/integration/csv-pipeline.test.ts` ("direct per-pair emit matches the
+ * split oracle") can diff the direct-emit output against this proven path. Do
+ * NOT delete it as dead code without also removing that test and accepting the
+ * loss of the byte-identity guard (and likewise `test/unit/rel-csv-split.test.ts`).
  *
  * Streams the CSV line-by-line, routing each relationship to a file named
  * `rel_{fromLabel}_{toLabel}.csv`. Handles backpressure correctly: only one
@@ -170,6 +182,11 @@ let currentDbPath: string | null = null;
 let currentDbReadOnly = false;
 let ftsLoaded = false;
 let vectorExtensionLoaded = false;
+// In-process guard so a repeated createVectorIndex() within one connection
+// lifetime skips the DB round-trip (mirrors ensuredFTSIndexes). Reset wherever
+// vectorExtensionLoaded resets, so it can never stay true against a swapped or
+// closed connection.
+let vectorIndexEnsured = false;
 
 /**
  * In-process cache of FTS indexes observed against the current singleton
@@ -213,8 +230,18 @@ const DB_LOCK_RETRY_DELAY_MS = 500;
  * analyze` and either already happened or will happen on the next run.
  */
 export const isReadOnlyDbError = (err: unknown): boolean => {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /read-only database/i.test(msg);
+  // Walk the `cause` chain (bounded) so a wrapped read-only error — e.g. the
+  // pool adapter's `new Error('…read-only.', { cause: nativeReadOnlyErr })` —
+  // is still detected by callers that only see the wrapper (#2068 follow-up).
+  // The same strict regex is re-applied at each level, so a non-read-only
+  // chain stays false; the depth bound guards a cyclic `cause`.
+  let cur: unknown = err;
+  for (let depth = 0; depth < 5 && cur != null; depth++) {
+    const msg = cur instanceof Error ? cur.message : String(cur);
+    if (/read-only database/i.test(msg)) return true;
+    cur = cur instanceof Error ? (cur as { cause?: unknown }).cause : undefined;
+  }
+  return false;
 };
 
 const isMissingFileError = (err: unknown): boolean => {
@@ -392,12 +419,10 @@ const runWithSessionLock = async <T>(operation: () => Promise<T>): Promise<T> =>
 const normalizeCopyPath = (filePath: string): string =>
   toNativeSafePath(filePath).replace(/\\/g, '/');
 
+// Single-result convenience wrapper over the shared best-effort closer
+// (drainQueryResult / readQueryRows close one cursor at a time).
 const closeQueryResult = async (result: lbug.QueryResult): Promise<void> => {
-  try {
-    await result.close();
-  } catch {
-    // Best-effort cleanup only.
-  }
+  await closeQueryResults(result);
 };
 
 const drainQueryResult = async (
@@ -594,6 +619,7 @@ const resetOpenConnectionState = (): void => {
   currentDbPath = null;
   ftsLoaded = false;
   vectorExtensionLoaded = false;
+  vectorIndexEnsured = false;
   ensuredFTSIndexes.clear();
 };
 
@@ -681,6 +707,7 @@ export const withLbugDb = async <T>(
         currentDbPath = null;
         ftsLoaded = false;
         vectorExtensionLoaded = false;
+        vectorIndexEnsured = false;
         ensuredFTSIndexes.clear();
       });
       // Sleep outside the lock — no need to block others while waiting
@@ -707,6 +734,7 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
     currentDbPath = null;
     ftsLoaded = false;
     vectorExtensionLoaded = false;
+    vectorIndexEnsured = false;
     ensuredFTSIndexes.clear();
   }
 
@@ -848,11 +876,87 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
 
 export type LbugProgressCallback = (message: string) => void;
 
+/**
+ * Run a COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
+ * errors) on first failure. On a second failure, hand the RAW retry error to
+ * `onError` — each call site formats + slices its own message (#2226 F5: node
+ * COPY slices to 200 chars and throws; relationship COPY slices to 80 and warns,
+ * so the helper must not pre-format and lose that distinction). `onError` may
+ * throw to propagate the failure.
+ */
+const copyCsvWithRetry = async (
+  targetConn: lbug.Connection,
+  copyQuery: string,
+  onError: (retryErr: unknown) => void,
+): Promise<void> => {
+  try {
+    await queryAndDrain(targetConn, copyQuery);
+  } catch {
+    try {
+      const retryQuery = copyQuery.replace(
+        'auto_detect=false)',
+        'auto_detect=false, IGNORE_ERRORS=true)',
+      );
+      await queryAndDrain(targetConn, retryQuery);
+    } catch (retryErr) {
+      onError(retryErr);
+    }
+  }
+};
+
+/**
+ * Bulk-COPY every node CSV sequentially on the single writable connection
+ * (LadybugDB allows one write txn at a time). Extracted from loadGraphToLbug so
+ * it can run either at the node-phase boundary — overlapping the relationship
+ * emit pass (#2203) — or after emit in the serial escape-hatch path. Each COPY
+ * keeps the IGNORE_ERRORS=true retry; a hard failure throws (no node rows ⇒ the
+ * relationship COPY would dangle on missing endpoints).
+ */
+const copyNodeCSVs = async (
+  targetConn: lbug.Connection,
+  nodeFileEntries: [NodeTableName, { csvPath: string; rows: number }][],
+  log: (message: string) => void,
+  totalSteps: number,
+): Promise<void> => {
+  let stepsDone = 0;
+  for (const [table, { csvPath, rows }] of nodeFileEntries) {
+    stepsDone++;
+    log(`Loading nodes ${stepsDone}/${totalSteps}: ${table} (${rows.toLocaleString()} rows)`);
+
+    const copyQuery = getCopyQuery(table, normalizeCopyPath(csvPath));
+    await copyCsvWithRetry(targetConn, copyQuery, (retryErr) => {
+      const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+      throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
+    });
+  }
+};
+
+/**
+ * Persist a KnowledgeGraph: stream CSVs, then bulk-COPY nodes (overlapped with
+ * relationship emit — see the body) and relationships.
+ *
+ * NOT TRANSACTIONAL (#2226). Each `COPY` commits independently and there is no
+ * surrounding transaction, so a failure partway through — a node `COPY` that
+ * throws at the FK barrier, a relationship `COPY` failure, or a `pdgEmitManifest`
+ * collision raised after node rows have already committed in the overlap path —
+ * leaves a partially-loaded DB. The caller surfaces the error; recovery is a
+ * `--force` re-analyze (a full rebuild), not a partial retry. Callers must not
+ * assume the DB is either fully loaded or untouched after a rejection.
+ */
 export const loadGraphToLbug = async (
   graph: KnowledgeGraph,
   repoPath: string,
   storagePath: string,
   onProgress?: LbugProgressCallback,
+  /**
+   * Streamed PDG-emit manifest (#2202). When present (streaming was on, full
+   * rebuild), the BasicBlock node CSV + per-pair PDG-edge CSVs it points at
+   * were already flushed to disk during the emit loop; they are merged into the
+   * COPY plan below so they load alongside the structural CSVs. When streaming
+   * was on the in-memory `graph` holds zero BasicBlocks, so `streamAllCSVsToDisk`
+   * emits none — the manifest is the sole source and there is no double-COPY.
+   */
+  pdgEmitManifest?: PdgEmitManifest,
 ) => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -860,101 +964,164 @@ export const loadGraphToLbug = async (
 
   const log = onProgress || (() => {});
 
-  let csvDir: string;
-  if (process.platform === 'win32' && /[^\x00-\x7F]/.test(storagePath)) {
-    const hash = crypto.createHash('sha256').update(storagePath).digest('hex').slice(0, 16);
-    csvDir = toNativeSafePath(path.join(os.tmpdir(), `gitnexus-csv-${hash}`));
-  } else {
-    csvDir = path.join(storagePath, 'csv');
-  }
+  // ── #2203 persistence-path profiling ──────────────────────────────────
+  // Mirrors the PROF_SCOPE_RESOLUTION pattern (scope-resolution/pipeline/
+  // run.ts): zero-cost when off — process.hrtime.bigint() is only read under
+  // PROF_LBUG_LOAD=1, and the summary is logged behind the same gate. Fills
+  // the gap that the DB-persistence path is un-timed today (the analyze
+  // "emit" number is the scope-resolution emit bucket, not this COPY path).
+  const PROF = process.env.PROF_LBUG_LOAD === '1';
+  // Escape hatch / differential oracle (#2203): force the legacy strictly-serial
+  // load order (emit everything, THEN COPY nodes, THEN COPY rels) instead of the
+  // default node-COPY ‖ rel-emit overlap. Lets an operator revert the behavior at
+  // runtime, and lets a test load the same graph both ways and assert identical
+  // persisted content.
+  const SERIAL = process.env.GITNEXUS_SERIAL_LBUG_LOAD === '1';
+  const mark = (): bigint => (PROF ? process.hrtime.bigint() : 0n);
+  const span = (a: bigint, b: bigint): string => (Number(b - a) / 1e6).toFixed(1);
+  const tStart = mark();
 
-  log('Streaming CSVs to disk...');
-  const csvResult = await streamAllCSVsToDisk(graph, repoPath, csvDir);
+  const csvDir = resolveNativeSafeStorageDir(storagePath, 'csv');
 
+  // The single writable connection (LadybugDB is single-writer). Captured as a
+  // const so the node-COPY closure has a non-null reference — TS cannot narrow
+  // the reassignable module-level `conn` across the callback boundary.
+  const writeConn = conn;
   const validTables = new Set<string>(NODE_TABLES as readonly string[]);
-  const getNodeLabel = (nodeId: string): string => {
-    if (nodeId.startsWith('comm_')) return 'Community';
-    if (nodeId.startsWith('proc_')) return 'Process';
-    return nodeId.split(':')[0];
+
+  // Merge the streamed PDG-emit node CSVs (#2202) into a node-file map. Collision
+  // guard: a BasicBlock in the in-memory graph during a streamed run is an
+  // invariant violation (streamAllCSVsToDisk would also emit basicblock.csv), so
+  // fail loudly rather than drop rows (#2202 review #3). Runs at the node-phase
+  // boundary so the manifest BasicBlock table COPYs with the structural CSVs.
+  const mergeManifestNodeFiles = (
+    nodeFilesMap: Map<NodeTableName, { csvPath: string; rows: number }>,
+  ): void => {
+    if (!pdgEmitManifest) return;
+    for (const [table, meta] of pdgEmitManifest.nodeFiles) {
+      if (nodeFilesMap.has(table)) {
+        throw new Error(
+          `Streaming PDG manifest collides with a structural node CSV for "${table}" — ` +
+            `the in-memory graph should hold zero ${table} nodes when streaming. ` +
+            `A ${table} node leaked into the graph during a streamed emit.`,
+        );
+      }
+      nodeFilesMap.set(table, meta);
+    }
   };
 
-  // Bulk COPY all node CSVs (sequential — LadybugDB allows only one write txn at a time)
-  const nodeFiles = [...csvResult.nodeFiles.entries()];
-  const totalSteps = nodeFiles.length + 1; // +1 for relationships
-  let stepsDone = 0;
+  // Node COPY is the only DB write that can overlap relationship CSV emit: the
+  // rel pass writes new rel_*.csv files and never touches `conn`, while node COPY
+  // uses `conn` and never touches the rel files. We start node COPY at the
+  // node-phase boundary and let the rel pass run concurrently — the only
+  // single-writer-safe parallelism (#2203). The rel COPY still waits for node
+  // COPY (FK precondition), so the DB load order is unchanged.
+  let nodeCopyPromise: Promise<void> | undefined;
+  let nodeCopyError: unknown;
+  const beginNodeCopy = (
+    nodeFilesMap: Map<NodeTableName, { csvPath: string; rows: number }>,
+  ): void => {
+    mergeManifestNodeFiles(nodeFilesMap);
+    const entries = [...nodeFilesMap.entries()];
+    // copyNodeCSVs logs node progress as step/total; it processes only node
+    // tables (the rel COPY has its own "Loading edges" progress line), so the
+    // denominator is the node-table count — not +1 reserving a rel step.
+    // .catch captures the failure so an overlapped (mid-emit) rejection cannot
+    // surface as an unhandled rejection; it is rethrown at the FK barrier below.
+    nodeCopyPromise = copyNodeCSVs(writeConn, entries, log, entries.length).catch((e) => {
+      nodeCopyError = e;
+    });
+  };
 
-  for (const [table, { csvPath, rows }] of nodeFiles) {
-    stepsDone++;
-    log(`Loading nodes ${stepsDone}/${totalSteps}: ${table} (${rows.toLocaleString()} rows)`);
+  log('Streaming CSVs to disk...');
+  let csvResult: StreamedCSVResult;
+  try {
+    csvResult = SERIAL
+      ? await streamAllCSVsToDisk(graph, repoPath, csvDir)
+      : await streamAllCSVsToDisk(graph, repoPath, csvDir, beginNodeCopy);
+  } catch (emitErr) {
+    // Relationship emit failed. In overlap mode a node COPY may be in flight —
+    // settle it (the .catch above means this never rejects) before rethrowing so
+    // it cannot leak as an unhandled rejection.
+    if (nodeCopyPromise) await nodeCopyPromise;
+    // If node COPY ALSO failed, emitErr wins the throw — log the swallowed node
+    // error so a half-loaded DB isn't misattributed to the emit failure alone.
+    if (nodeCopyError) {
+      logger.warn(
+        { err: nodeCopyError },
+        '[lbug-load] node COPY also failed while relationship emit was failing',
+      );
+    }
+    throw emitErr;
+  }
+  const tCsv = mark();
 
-    const normalizedPath = normalizeCopyPath(csvPath);
-    const copyQuery = getCopyQuery(table, normalizedPath);
-
-    try {
-      await queryAndDrain(conn, copyQuery);
-    } catch (err) {
-      try {
-        const retryQuery = copyQuery.replace(
-          'auto_detect=false)',
-          'auto_detect=false, IGNORE_ERRORS=true)',
+  // Merge the streamed PDG-emit per-pair rel CSVs (#2202) into the COPY plan —
+  // collision-guarded. Done BEFORE node COPY so the serial escape hatch detects a
+  // manifest/structural pair collision before committing any node rows (legacy
+  // parity with the pre-overlap path), and the overlap path detects it as early
+  // as csvResult is available. When a manifest is present, streaming was on and
+  // the in-memory graph held zero BasicBlocks, so a structural collision means a
+  // streaming-invariant violation — fail loudly rather than load corrupt data.
+  if (pdgEmitManifest) {
+    for (const [pairKey, meta] of pdgEmitManifest.relsByPair) {
+      if (csvResult.relsByPair.has(pairKey)) {
+        throw new Error(
+          `Streaming PDG manifest collides with a structural relationship CSV for pair ` +
+            `"${pairKey}" — a PDG edge leaked into the in-memory graph during a streamed emit.`,
         );
-        await queryAndDrain(conn, retryQuery);
-      } catch (retryErr) {
-        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-        throw new Error(`COPY failed for ${table}: ${retryMsg.slice(0, 200)}`);
       }
+      csvResult.relsByPair.set(pairKey, meta);
+      csvResult.totalValidRels += meta.rows;
     }
   }
 
-  // Bulk COPY relationships — split by FROM→TO label pair (LadybugDB requires it)
-  const { relHeader, relsByPairMeta, pairWriteStreams, skippedRels, totalValidRels } =
-    await splitRelCsvByLabelPair(csvResult.relCsvPath, csvDir, validTables, getNodeLabel);
+  // Serial path: all CSVs are on disk and node COPY has not started — start it
+  // here so the barrier below blocks on it exactly as the legacy path did.
+  if (SERIAL) beginNodeCopy(csvResult.nodeFiles);
 
-  // Close all per-pair write streams before COPY. `stream/promises.finished`
-  // resolves on the stream's 'finish' event and rejects on 'error' — replaces
-  // a hand-rolled promisification with the stdlib primitive.
-  await Promise.all(
-    Array.from(pairWriteStreams.values()).map(async (ws) => {
-      ws.end();
-      await finished(ws);
-    }),
-  );
+  // FK barrier: node rows must exist before the relationship COPY resolves their
+  // endpoints. In overlap mode most of node COPY was hidden behind rel emit, so
+  // this await is the *residual* node-COPY time (≈0 when fully overlapped).
+  if (nodeCopyPromise) await nodeCopyPromise;
+  if (nodeCopyError) {
+    throw nodeCopyError instanceof Error ? nodeCopyError : new Error(String(nodeCopyError));
+  }
+  const tCopyNodes = mark();
+
+  // Bulk COPY relationships. They were already routed to per-FROM→TO-label-pair
+  // files during the emit pass (#2203 U2) — there is no monolithic relations.csv
+  // to re-read/re-split here; we COPY each pair file directly.
+  const { relsByPair, relHeader, skippedRels, totalValidRels } = csvResult;
+  let tCopyRels = tCopyNodes;
+  let tFallback = tCopyNodes;
 
   const insertedRels = totalValidRels;
   const warnings: string[] = [];
   if (insertedRels > 0) {
-    log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPairMeta.size} types`);
+    log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPair.size} types`);
 
     let pairIdx = 0;
     let failedPairEdges = 0;
     const failedPairCsvPaths = new Set<string>();
 
-    for (const [pairKey, { csvPath: pairCsvPath, rows }] of relsByPairMeta) {
+    for (const [pairKey, { csvPath: pairCsvPath, rows }] of relsByPair) {
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const normalizedPath = normalizeCopyPath(pairCsvPath);
+      // PARALLEL=false is load-bearing here too — see COPY_CSV_OPTS (#2203 / kuzudb/kuzu#5778).
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
       if (pairIdx % 5 === 0 || rows > 1000) {
-        log(`Loading edges: ${pairIdx}/${relsByPairMeta.size} types (${fromLabel} -> ${toLabel})`);
+        log(`Loading edges: ${pairIdx}/${relsByPair.size} types (${fromLabel} -> ${toLabel})`);
       }
 
-      try {
-        await queryAndDrain(conn, copyQuery);
-      } catch (err) {
-        try {
-          const retryQuery = copyQuery.replace(
-            'auto_detect=false)',
-            'auto_detect=false, IGNORE_ERRORS=true)',
-          );
-          await queryAndDrain(conn, retryQuery);
-        } catch (retryErr) {
-          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-          warnings.push(`${fromLabel}->${toLabel} (${rows} edges): ${retryMsg.slice(0, 80)}`);
-          failedPairEdges += rows;
-          failedPairCsvPaths.add(pairCsvPath);
-        }
-      }
+      await copyCsvWithRetry(conn, copyQuery, (retryErr) => {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        warnings.push(`${fromLabel}->${toLabel} (${rows} edges): ${retryMsg.slice(0, 80)}`);
+        failedPairEdges += rows;
+        failedPairCsvPaths.add(pairCsvPath);
+      });
       // Only delete if not in failedPairCsvPaths (needed for fallback)
       if (!failedPairCsvPaths.has(pairCsvPath)) {
         try {
@@ -962,6 +1129,7 @@ export const loadGraphToLbug = async (
         } catch {}
       }
     }
+    tCopyRels = mark();
 
     if (failedPairCsvPaths.size > 0) {
       log(`Inserting ${failedPairEdges} edges individually (missing schema pairs)`);
@@ -981,15 +1149,14 @@ export const loadGraphToLbug = async (
         } catch {}
       }
       if (allLines.length > 1) {
-        await fallbackRelationshipInserts(allLines, validTables, getNodeLabel);
+        await fallbackRelationshipInserts(allLines, validTables, deriveNodeLabel);
       }
     }
+    tFallback = mark();
   }
 
-  // Cleanup all CSVs
-  try {
-    await fs.unlink(csvResult.relCsvPath);
-  } catch {}
+  // Cleanup all CSVs (per-pair rel files are unlinked in the COPY loop above;
+  // the remaining sweep below catches node CSVs + any leftover pair files).
   for (const [, { csvPath }] of csvResult.nodeFiles) {
     try {
       await fs.unlink(csvPath);
@@ -1007,6 +1174,23 @@ export const loadGraphToLbug = async (
     await fs.rmdir(csvDir);
   } catch {}
 
+  if (PROF) {
+    const tEnd = mark();
+    let totalNodeRows = 0;
+    for (const [, { rows }] of csvResult.nodeFiles) totalNodeRows += rows;
+    // `mode` records which load path ran. In overlap mode `csv-emit` is the wall
+    // to streamAllCSVsToDisk's return (node COPY overlapped part of it) and
+    // `copy-nodes` is the RESIDUAL node-COPY await after emit returned — it
+    // trends to 0 as the overlap hides node COPY behind relationship emit. In
+    // serial mode the buckets carry their legacy, disjoint meaning.
+    logger.warn(
+      `[lbug-load prof] mode=${SERIAL ? 'serial' : 'overlap'} csv-emit=${span(tStart, tCsv)}ms ` +
+        `copy-nodes=${span(tCsv, tCopyNodes)}ms copy-rels=${span(tCopyNodes, tCopyRels)}ms ` +
+        `fallback=${span(tCopyRels, tFallback)}ms total=${span(tStart, tEnd)}ms ` +
+        `(${totalNodeRows} nodes, ${insertedRels} rels)`,
+    );
+  }
+
   return { success: true, insertedRels, skippedRels, warnings };
 };
 
@@ -1014,7 +1198,18 @@ export const loadGraphToLbug = async (
 // Source code content is full of backslashes which confuse the auto-detection.
 // We MUST explicitly set ESCAPE='"' to use RFC 4180 escaping, and disable auto_detect to prevent
 // LadybugDB from overriding our settings based on sample rows.
-const COPY_CSV_OPTS = `(HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
+//
+// PARALLEL=false IS LOAD-BEARING FOR CORRECTNESS — DO NOT FLIP IT (#2203).
+// LadybugDB's parallel CSV reader (Kuzu-derived; default PARALLEL=true) splits the
+// file into byte ranges parsed concurrently, and CANNOT determine line boundaries
+// when a quoted field contains an embedded newline — it errors with "Quoted newlines
+// are not supported in parallel CSV reader. Please specify PARALLEL=FALSE", or worse,
+// mis-parses silently (upstream kuzudb/kuzu#5778, still open). Our `content`/`text`
+// columns hold source code, so quoted multiline fields are guaranteed. PARALLEL=false
+// is therefore required, not conservative. The multiline-quoted round-trip in
+// test/integration/copy-parallel-invariant.test.ts fails loudly if this is ever flipped.
+// Exported so that test asserts the invariant statically as well.
+export const COPY_CSV_OPTS = `(HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
 // Multi-language table names that were created with backticks in CODE_ELEMENT_BASE
 // and must always be referenced with backticks in queries
@@ -1092,7 +1287,7 @@ const TABLES_WITH_EXPORTED = new Set<string>([
   'CodeElement',
 ]);
 
-const getCopyQuery = (table: NodeTableName, filePath: string): string => {
+export const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   const t = escapeTableName(table);
   if (table === 'File') {
     return `COPY ${t}(id, name, filePath, content) FROM "${filePath}" ${COPY_CSV_OPTS}`;
@@ -1114,6 +1309,10 @@ const getCopyQuery = (table: NodeTableName, filePath: string): string => {
   }
   if (table === 'Tool') {
     return `COPY ${t}(id, name, filePath, description) FROM "${filePath}" ${COPY_CSV_OPTS}`;
+  }
+  if (table === 'BasicBlock') {
+    // Taint/PDG substrate (issue #2080) — no name column.
+    return `COPY ${t}(id, filePath, startLine, endLine, text) FROM "${filePath}" ${COPY_CSV_OPTS}`;
   }
   if (table === 'Method') {
     return `COPY ${t}(id, name, filePath, startLine, endLine, isExported, content, description, parameterCount, returnType) FROM "${filePath}" ${COPY_CSV_OPTS}`;
@@ -1167,6 +1366,9 @@ export const insertNodeToLbug = async (
         ? `, description: ${escapeValue(properties.description)}`
         : '';
       query = `CREATE (n:Section {id: ${escapeValue(properties.id)}, name: ${escapeValue(properties.name)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, level: ${properties.level || 1}, content: ${escapeValue(properties.content || '')}${descPart}})`;
+    } else if (label === 'BasicBlock') {
+      // Taint/PDG substrate (issue #2080) — no name column.
+      query = `CREATE (n:BasicBlock {id: ${escapeValue(properties.id)}, filePath: ${escapeValue(properties.filePath)}, startLine: ${properties.startLine || 0}, endLine: ${properties.endLine || 0}, text: ${escapeValue(properties.text || '')}})`;
     } else if (TABLES_WITH_EXPORTED.has(label)) {
       const descPart = properties.description
         ? `, description: ${escapeValue(properties.description)}`
@@ -1250,6 +1452,9 @@ export const batchInsertNodesToLbug = async (
             ? `, n.description = ${escapeValue(properties.description)}`
             : '';
           query = `MERGE (n:Section {id: ${escapeValue(properties.id)}}) SET n.name = ${escapeValue(properties.name)}, n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.level = ${properties.level || 1}, n.content = ${escapeValue(properties.content || '')}${descPart}`;
+        } else if (label === 'BasicBlock') {
+          // Taint/PDG substrate (issue #2080) — no name column.
+          query = `MERGE (n:BasicBlock {id: ${escapeValue(properties.id)}}) SET n.filePath = ${escapeValue(properties.filePath)}, n.startLine = ${properties.startLine || 0}, n.endLine = ${properties.endLine || 0}, n.text = ${escapeValue(properties.text || '')}`;
         } else if (TABLES_WITH_EXPORTED.has(label)) {
           const descPart = properties.description
             ? `, n.description = ${escapeValue(properties.description)}`
@@ -1652,6 +1857,7 @@ export const closeLbug = async (): Promise<void> => {
   currentDbPath = null;
   ftsLoaded = false;
   vectorExtensionLoaded = false;
+  vectorIndexEnsured = false;
   ensuredFTSIndexes.clear();
 };
 
@@ -1758,8 +1964,9 @@ export const queryImporters = async (targetFilePath: string): Promise<string[]> 
     WHERE r.type = 'IMPORTS' AND b.filePath = '${escaped}'
     RETURN DISTINCT a.filePath AS importer
   `;
+  let queryResult: lbug.QueryResult | lbug.QueryResult[] | undefined;
   try {
-    const queryResult = await conn.query(cypher);
+    queryResult = await conn.query(cypher);
     const result = Array.isArray(queryResult) ? queryResult[0] : queryResult;
     const rows = await result.getAll();
     const out: string[] = [];
@@ -1770,6 +1977,8 @@ export const queryImporters = async (targetFilePath: string): Promise<string[]> 
     return out;
   } catch {
     return [];
+  } finally {
+    if (queryResult) await closeQueryResults(queryResult);
   }
 };
 
@@ -1788,8 +1997,9 @@ export const deleteAllCommunitiesAndProcesses = async (): Promise<{
   }
   let nodesDeleted = 0;
   for (const label of ['Community', 'Process']) {
+    let countResult: lbug.QueryResult | lbug.QueryResult[] | undefined;
     try {
-      const countResult = await conn.query(`MATCH (n:${label}) RETURN count(n) AS cnt`);
+      countResult = await conn.query(`MATCH (n:${label}) RETURN count(n) AS cnt`);
       const result = Array.isArray(countResult) ? countResult[0] : countResult;
       const rows = await result.getAll();
       const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
@@ -1799,9 +2009,67 @@ export const deleteAllCommunitiesAndProcesses = async (): Promise<{
       }
     } catch {
       // Table may not exist yet on a freshly-initialized DB — fine.
+    } finally {
+      if (countResult) await closeQueryResults(countResult);
     }
   }
   return { nodesDeleted };
+};
+
+/**
+ * Drop every interprocedural `TAINT_PATH` relationship (#2084 M4 U6). Used at
+ * the start of an incremental `--pdg` writeback so the `taintSummaries` phase
+ * re-materialises them from scratch on the FULL recomputed graph.
+ *
+ * TAINT_PATH validity is a WHOLE-PROGRAM property (a flow A→C can be
+ * invalidated by a change to an INTERMEDIATE function whose file is neither A
+ * nor C). The endpoint-writability extract rule (`extractChangedSubgraph`)
+ * cannot see that — an A→C edge between two unchanged files would be skipped
+ * and a stale finding would survive. So, exactly like Community/Process, the
+ * sound move is delete-all-then-rebuild: cheap because TAINT_PATH is sparse
+ * (per-run capped), and the compute side already rebuilds every summary each
+ * run. Relationship-level (TAINT_PATH is an edge type, not a node label), so a
+ * plain DELETE on the typed CodeRelation rows — endpoints are untouched.
+ */
+export const deleteAllInterprocTaintPaths = async (): Promise<{ edgesDeleted: number }> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  let edgesDeleted = 0;
+  let countResult: lbug.QueryResult | lbug.QueryResult[] | undefined;
+  try {
+    countResult = await conn.query(
+      `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' RETURN count(r) AS cnt`,
+    );
+    const result = Array.isArray(countResult) ? countResult[0] : countResult;
+    const rows = await result.getAll();
+    const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
+    if (count > 0) {
+      await conn.query(`MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' DELETE r`);
+      edgesDeleted = count;
+    }
+  } catch (err) {
+    // A missing table on a freshly-initialized DB is the benign, expected case
+    // (the count query above is what throws) — stay silent. Any OTHER failure
+    // (lock, disk, native error) would leave stale TAINT_PATH rows that the
+    // subsequent re-extract then DUPLICATES (CodeRelation has no PK), so it
+    // must ABORT the writeback (#2084 review P2-5): re-throw so the caller's
+    // crash-recovery dirty flag forces a clean full rebuild on the next run,
+    // rather than silently writing duplicate cross-function findings.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/no table|not exist|not found|does not exist|Table .* does not exist/i.test(msg)) {
+      if (countResult) await closeQueryResults(countResult);
+      return { edgesDeleted };
+    }
+    if (countResult) await closeQueryResults(countResult);
+    throw new Error(
+      `[taint-interproc] failed to clear existing TAINT_PATH edges before incremental ` +
+        `re-write (${msg}) — aborting to avoid duplicate cross-function findings; ` +
+        `the next run will full-rebuild`,
+    );
+  }
+  if (countResult) await closeQueryResults(countResult);
+  return { edgesDeleted };
 };
 
 // ============================================================================
@@ -1909,6 +2177,50 @@ export const createFTSIndex = async (
       ensuredFTSIndexes.add(key);
       return;
     }
+    throw e;
+  }
+};
+
+/**
+ * Create the HNSW vector index on the CodeEmbedding table.
+ *
+ * MUST run via `conn.query()` (here through `queryAndDrain`), NOT through the
+ * prepared `executeQuery`/`conn.prepare()` path: `CALL CREATE_VECTOR_INDEX(...)`
+ * compiles to multiple statements, which LadybugDB cannot prepare — it fails
+ * with "Connection Exception: We do not support prepare multiple statements."
+ * Routing index creation through `executeQuery` (prepared) is exactly what
+ * broke vector-index creation during `analyze` (#2114; the singleton
+ * `executeQuery` was switched to the prepared path in #1655 while FTS index
+ * creation kept using `conn.query()`, which is why FTS survived and VECTOR did
+ * not). Mirrors `createFTSIndex` above.
+ *
+ * Returns `true` on success (or when the index already exists — idempotent so
+ * incremental re-runs don't spuriously downgrade to exact scan), `false` when
+ * the VECTOR extension is unavailable or the connection is read-only. Any other
+ * failure propagates so the caller can log it.
+ */
+export const createVectorIndex = async (): Promise<boolean> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  // Already built on this connection — skip the round-trip (mirrors createFTSIndex).
+  if (vectorIndexEnsured) return true;
+  if (!(await loadVectorExtension())) {
+    return false;
+  }
+  try {
+    await queryAndDrain(conn, CREATE_VECTOR_INDEX_QUERY);
+    vectorIndexEnsured = true;
+    return true;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Idempotent: a prior analyze already built the HNSW index.
+    if (msg.includes('already exists')) {
+      vectorIndexEnsured = true;
+      return true;
+    }
+    // Read-only DB (e.g. the MCP query pool): writable analyze owns creation.
+    if (isReadOnlyDbError(e)) return false;
     throw e;
   }
 };
