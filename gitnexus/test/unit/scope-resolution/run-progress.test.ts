@@ -104,4 +104,52 @@ describe('runScopeResolution onProgress', () => {
     expect(stats.filesProcessed).toBe(0);
     expect(calls).toEqual([{ subPhase: 'extracting', current: 0, total: 0 }]);
   });
+
+  it('yields to the event loop during the scope-resolution cascade', async () => {
+    const files = Array.from({ length: 256 }, (_, index) => ({
+      path: `file-${index}.py`,
+      content: '',
+    }));
+    const preExtracted = new Map<string, ParsedFile>(
+      files.map((file) => [file.path, mkFile(file.path)]),
+    );
+    let eventLoopTurnObserved = false;
+    setImmediate(() => {
+      eventLoopTurnObserved = true;
+    });
+
+    await runScopeResolution(
+      {
+        graph: createKnowledgeGraph(),
+        model: createSemanticModel(),
+        files,
+        preExtractedParsedFiles: preExtracted,
+      },
+      stubProvider,
+    );
+
+    expect(eventLoopTurnObserved).toBe(true);
+  });
+
+  it('rejects when a provider hook fails', async () => {
+    const files = [{ path: 'broken.py', content: '' }];
+    const rejectingProvider = {
+      ...stubProvider,
+      populateOwners: () => {
+        throw new Error('populate failed');
+      },
+    };
+
+    await expect(
+      runScopeResolution(
+        {
+          graph: createKnowledgeGraph(),
+          model: createSemanticModel(),
+          files,
+          preExtractedParsedFiles: new Map([['broken.py', mkFile('broken.py')]]),
+        },
+        rejectingProvider,
+      ),
+    ).rejects.toThrow('populate failed');
+  });
 });

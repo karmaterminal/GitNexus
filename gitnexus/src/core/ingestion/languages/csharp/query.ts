@@ -41,6 +41,12 @@ const CSHARP_SCOPE_QUERY = `
 (namespace_declaration) @scope.namespace
 (file_scoped_namespace_declaration) @scope.namespace
 
+(namespace_declaration
+  name: (_) @declaration.name) @declaration.namespace
+
+(file_scoped_namespace_declaration
+  name: (_) @declaration.name) @declaration.namespace
+
 (class_declaration) @scope.class
 (interface_declaration) @scope.class
 (struct_declaration) @scope.class
@@ -57,24 +63,44 @@ const CSHARP_SCOPE_QUERY = `
 ;; Anonymous methods / lambdas are not scoped — out of scope per plan.
 
 ;; Declarations — types
+;; The parameter list is matched as an UNNAMED optional child, not through a
+;; \`type_parameters:\` field: the C# grammar gives \`interface_declaration\` that
+;; field but \`class_declaration\` / \`struct_declaration\` / \`record_declaration\`
+;; only a bare \`type_parameter_list\` child, so the field form would silently
+;; capture nothing on exactly the three most common declarations. The unnamed
+;; form matches all four.
+;;
+;; A \`where T : IRepo\` constraint is a SEPARATE sibling clause
+;; (\`type_parameter_constraints_clause\`) and is deliberately not read here — the
+;; bound stays absent for C#, which reads as "unknown", the safe direction.
 (class_declaration
-  name: (identifier) @declaration.name) @declaration.class
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.class
 
 (interface_declaration
-  name: (identifier) @declaration.name) @declaration.interface
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.interface
 
 (struct_declaration
-  name: (identifier) @declaration.name) @declaration.struct
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.struct
 
 (record_declaration
-  name: (identifier) @declaration.name) @declaration.record
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.record
 
 (enum_declaration
   name: (identifier) @declaration.name) @declaration.enum
 
 ;; Declarations — methods / constructors / properties
+;;
+;; A generic METHOD's parameters are read for the same reason a generic type's
+;; are (#2912 review): \`void Run<T>(IValidator<T> v)\` writes a receiver whose
+;; argument is a type VARIABLE, and a pass that cannot tell that from a concrete
+;; type prunes every implementor of \`IValidator\` from the call's fan-out.
 (method_declaration
-  name: (identifier) @declaration.name) @declaration.method
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.method
 
 (constructor_declaration
   name: (identifier) @declaration.name) @declaration.constructor
@@ -481,6 +507,13 @@ const CSHARP_SCOPE_QUERY = `
 
 (object_creation_expression
   type: (qualified_name) @reference.call.constructor.qualified) @reference.call.constructor
+
+;; Alias-qualified constructor: \`new MyAlias::Foo()\`, \`new global::Foo()\`. The
+;; top-level type is an alias_qualified_name (a \`global::Ns.Foo\` qualifier nests
+;; under qualified_name instead, covered above). No @reference.name here —
+;; captures.ts derives the simple-name tail via terminalTypeNameNode.
+(object_creation_expression
+  type: (alias_qualified_name) @reference.call.constructor.qualified) @reference.call.constructor
 
 ;; References — field/property writes: \`obj.Name = "x"\` emits a write
 ;; ACCESSES edge from the enclosing method to the field/property on

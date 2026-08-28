@@ -1,6 +1,6 @@
 // gitnexus/src/core/ingestion/method-types.ts
 
-import type { SupportedLanguages } from 'gitnexus-shared';
+import type { ParameterTypeClass, SupportedLanguages } from 'gitnexus-shared';
 import type { FieldVisibility } from './field-types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 
@@ -14,6 +14,7 @@ export interface ParameterInfo {
    *  Used by typeTagForId for overload disambiguation where generic args matter.
    *  Falls back to `type` when not set. */
   rawType?: string | null;
+  typeClass?: ParameterTypeClass;
   isOptional: boolean;
   isVariadic: boolean;
 }
@@ -32,9 +33,26 @@ export interface MethodInfo {
   isAsync?: boolean;
   isPartial?: boolean;
   isConst?: boolean;
+  isDeleted?: boolean;
   annotations: string[];
   sourceFile: string;
   line: number;
+  /**
+   * 0-based `startPosition.column` of the node `line` was derived from.
+   *
+   * `line` alone does NOT identify a callable. A callable that is SYNTHESIZED
+   * at a position that is not its own declaration shares its owner's line: a
+   * Java record's implicit component accessor is minted at the COMPONENT, and a
+   * C# 12 primary constructor at the owner's `parameter_list`. So both
+   * `record P(int x, int y) { int x(int s) {…} }` and
+   * `class Point(int x, int y) { public Point(int x) : this(x, 0) {} }` give two
+   * different callables the same (name, line) (#2936).
+   *
+   * Required, not optional: the per-class map in parse-worker keys on it, and
+   * an absent column would key an entry no lookup could ever reach — a silent,
+   * whole-language loss of method enrichment rather than a compile error.
+   */
+  column: number;
 }
 
 export interface MethodExtractorContext {
@@ -60,6 +78,7 @@ export interface MethodExtractor {
    *  Return null to fall through to the generic extractor. */
   extractFunctionName?(
     node: SyntaxNode,
+    filePath?: string,
   ): { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }
 
@@ -82,6 +101,7 @@ export interface MethodExtractionConfig {
   isAsync?: (node: SyntaxNode) => boolean;
   isPartial?: (node: SyntaxNode) => boolean;
   isConst?: (node: SyntaxNode) => boolean;
+  isDeleted?: (node: SyntaxNode) => boolean;
   /** Owner node types where member functions are effectively static (e.g.
    *  Ruby singleton_class, Kotlin companion_object / object_declaration).
    *  When the ownerNode matches one of these types, isStatic is forced true. */
@@ -97,5 +117,6 @@ export interface MethodExtractionConfig {
    *  Passed through to the MethodExtractor by createMethodExtractor. */
   extractFunctionName?: (
     node: SyntaxNode,
+    filePath?: string,
   ) => { funcName: string | null; label: import('gitnexus-shared').NodeLabel } | null;
 }

@@ -10,7 +10,13 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { runHook, parseHookOutput } from '../utils/hook-test-helpers.js';
+import {
+  runHook,
+  parseHookOutput,
+  createGitNexusPathEntry,
+  envWithPath,
+} from '../utils/hook-test-helpers.js';
+import { commitAll, initGitRepo } from '../helpers/temp-git-repo.js';
 
 // ─── Paths to both hook variants ────────────────────────────────────
 
@@ -41,14 +47,11 @@ beforeAll(() => {
   fs.mkdirSync(gitNexusDir, { recursive: true });
 
   // Initialize a real git repo
-  spawnSync('git', ['init'], { cwd: tmpDir, stdio: 'pipe' });
-  spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: tmpDir, stdio: 'pipe' });
-  spawnSync('git', ['config', 'user.name', 'Test'], { cwd: tmpDir, stdio: 'pipe' });
+  initGitRepo(tmpDir, { name: 'Test', email: 'test@test.com' });
 
   // Create a file and commit so HEAD exists
   fs.writeFileSync(path.join(tmpDir, 'hello.txt'), 'hello');
-  spawnSync('git', ['add', '.'], { cwd: tmpDir, stdio: 'pipe' });
-  spawnSync('git', ['commit', '-m', 'init'], { cwd: tmpDir, stdio: 'pipe' });
+  commitAll(tmpDir, 'init');
 });
 
 afterAll(() => {
@@ -66,18 +69,115 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
         JSON.stringify({ lastCommit: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stats: {} }),
       );
 
-      const result = runHook(hookPath, {
-        hook_event_name: 'PostToolUse',
-        tool_name: 'Bash',
-        tool_input: { command: 'git commit -m "test"' },
-        tool_output: { exit_code: 0 },
-        cwd: tmpDir,
-      });
+      const result = runHook(
+        hookPath,
+        {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        },
+        tmpDir,
+        { env: { ...process.env, GITNEXUS_INVOCATION: 'npx' } },
+      );
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
       expect(output!.additionalContext).toContain('stale');
-      expect(output!.additionalContext).toContain('npx gitnexus analyze');
+      expect(output!.additionalContext).toContain('npx gitnexus@latest analyze');
+    });
+
+    it('prefers pnpm dlx when GITNEXUS_INVOCATION=pnpm', () => {
+      fs.writeFileSync(
+        path.join(gitNexusDir, 'meta.json'),
+        JSON.stringify({ lastCommit: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', stats: {} }),
+      );
+
+      const result = runHook(
+        hookPath,
+        {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        },
+        tmpDir,
+        { env: { ...process.env, GITNEXUS_INVOCATION: 'pnpm' } },
+      );
+
+      const output = parseHookOutput(result.stdout);
+      expect(output).not.toBeNull();
+      expect(output!.additionalContext).toContain('--allow-build=@ladybugdb/core');
+      expect(output!.additionalContext).toContain('gitnexus@latest analyze');
+    });
+
+    it('auto-detects a PATH-installed gitnexus and suggests `gitnexus analyze` (no npx)', () => {
+      // No GITNEXUS_INVOCATION forcing — this exercises the hook's real PATH probe
+      // (#1938): a launcher on PATH must yield `gitnexus analyze`, never the
+      // npm-11 npx crash path. createGitNexusPathEntry scrubs any ambient gitnexus
+      // first, so the result cannot pass for the wrong reason.
+      fs.writeFileSync(
+        path.join(gitNexusDir, 'meta.json'),
+        JSON.stringify({ lastCommit: 'abababababababababababababababababababab', stats: {} }),
+      );
+      const gn = createGitNexusPathEntry();
+      try {
+        const result = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PostToolUse',
+            tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "test"' },
+            tool_output: { exit_code: 0 },
+            cwd: tmpDir,
+          },
+          tmpDir,
+          { env: envWithPath(gn.pathValue) },
+        );
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        expect(output!.additionalContext).toContain('Run `gitnexus analyze --index-only`');
+        expect(output!.additionalContext).not.toContain('npx gitnexus');
+      } finally {
+        gn.cleanup();
+      }
+    });
+
+    it('appends --embeddings to the auto-detected `gitnexus analyze` when the index had embeddings', () => {
+      fs.writeFileSync(
+        path.join(gitNexusDir, 'meta.json'),
+        JSON.stringify({
+          lastCommit: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+          stats: { embeddings: 42 },
+        }),
+      );
+      const gn = createGitNexusPathEntry();
+      try {
+        const result = runHook(
+          hookPath,
+          {
+            hook_event_name: 'PostToolUse',
+            tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "test"' },
+            tool_output: { exit_code: 0 },
+            cwd: tmpDir,
+          },
+          tmpDir,
+          { env: envWithPath(gn.pathValue) },
+        );
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        expect(output!.additionalContext).toContain(
+          'Run `gitnexus analyze --index-only --embeddings`',
+        );
+        expect(output!.additionalContext).not.toContain('npx gitnexus');
+      } finally {
+        gn.cleanup();
+      }
     });
 
     it('stays silent when meta.json lastCommit matches HEAD', () => {
@@ -116,17 +216,24 @@ describe.each(HOOKS)('hooks e2e ($name)', ({ name, path: hookPath }) => {
         }),
       );
 
-      const result = runHook(hookPath, {
-        hook_event_name: 'PostToolUse',
-        tool_name: 'Bash',
-        tool_input: { command: 'git commit -m "test"' },
-        tool_output: { exit_code: 0 },
-        cwd: tmpDir,
-      });
+      const result = runHook(
+        hookPath,
+        {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        },
+        tmpDir,
+        { env: { ...process.env, GITNEXUS_INVOCATION: 'npx' } },
+      );
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
-      expect(output!.additionalContext).toContain('--embeddings');
+      expect(output!.additionalContext).toContain(
+        'npx gitnexus@latest analyze --index-only --embeddings',
+      );
     });
 
     it('treats missing meta.json as stale', () => {

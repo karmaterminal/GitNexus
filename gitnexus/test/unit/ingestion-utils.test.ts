@@ -16,10 +16,13 @@ import {
   TREE_SITTER_MAX_BUFFER,
 } from '../../src/core/ingestion/constants.js';
 import Parser from 'tree-sitter';
-import C from 'tree-sitter-c';
 import CPP from 'tree-sitter-cpp';
 import Python from 'tree-sitter-python';
 import TypeScript from 'tree-sitter-typescript';
+import { requireVendoredGrammar } from '../../src/core/tree-sitter/vendored-grammars.js';
+
+// Vendored grammar — loaded from vendor/ by absolute path, never node_modules (#2111).
+const C = requireVendoredGrammar('tree-sitter-c');
 
 describe('getLanguageFromFilename', () => {
   describe('TypeScript', () => {
@@ -37,12 +40,9 @@ describe('getLanguageFromFilename', () => {
   });
 
   describe('JavaScript', () => {
-    it('detects .js files', () => {
-      expect(getLanguageFromFilename('index.js')).toBe(SupportedLanguages.JavaScript);
-    });
-
-    it('detects .jsx files', () => {
-      expect(getLanguageFromFilename('App.jsx')).toBe(SupportedLanguages.JavaScript);
+    it.each(['.js', '.jsx', '.mjs', '.cjs'])('detects %s files', (ext) => {
+      expect(getLanguageFromFilename(`module${ext}`)).toBe(SupportedLanguages.JavaScript);
+      expect(getProviderForFile(`src/module${ext}`)?.id).toBe(SupportedLanguages.JavaScript);
     });
   });
 
@@ -65,9 +65,12 @@ describe('getLanguageFromFilename', () => {
   });
 
   describe('C++', () => {
-    it.each(['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh'])('detects %s files', (ext) => {
-      expect(getLanguageFromFilename(`file${ext}`)).toBe(SupportedLanguages.CPlusPlus);
-    });
+    it.each(['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh', '.cu', '.cuh'])(
+      'detects %s files',
+      (ext) => {
+        expect(getLanguageFromFilename(`file${ext}`)).toBe(SupportedLanguages.CPlusPlus);
+      },
+    );
   });
 
   describe('C#', () => {
@@ -168,6 +171,11 @@ describe('getProviderForFile', () => {
     expect(getProviderForFile('vendor/mage-os/templates/product/list.phtml')?.id).toBe(
       SupportedLanguages.PHP,
     );
+  });
+
+  it('routes CUDA C++ source and header files to the C++ provider', () => {
+    expect(getProviderForFile('src/kernels/integrate.cu')?.id).toBe(SupportedLanguages.CPlusPlus);
+    expect(getProviderForFile('src/force/nep.cuh')?.id).toBe(SupportedLanguages.CPlusPlus);
   });
 });
 

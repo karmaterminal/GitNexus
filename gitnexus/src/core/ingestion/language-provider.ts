@@ -27,56 +27,72 @@ import type {
 } from 'gitnexus-shared';
 import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
-import type {
-  CallExtractor,
-  DispatchDecision,
-  ImplicitReceiverOverride,
-  ReceiverEnriched,
-} from './call-types.js';
+import type { CallExtractor } from './call-types.js';
 import type { ClassExtractor } from './class-types.js';
 import type { ExportChecker } from './export-detection.js';
 import type { FieldExtractor } from './field-extractor.js';
-import type { HeritageExtractor } from './heritage-types.js';
 import type { MethodExtractor } from './method-types.js';
 import type { VariableExtractor } from './variable-types.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
-import type { NamedBindingExtractorFn } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import type { CfgVisitor } from './cfg/types.js';
 import type { NodeLabel } from 'gitnexus-shared';
+import type { ExtractedRoute } from './route-extractors/laravel.js';
+import type { SharedSpringType } from './route-extractors/spring-shared.js';
+import type {
+  ModuleConstants,
+  Operand,
+  RepoConstants,
+} from './route-extractors/constant-resolver.js';
+import type Parser from 'tree-sitter';
+import type { ExtractedDecoratorRoute } from './workers/parse-worker.js';
 
 // ── Shared type aliases ────────────────────────────────────────────────────
 /** Tree-sitter query captures: capture name → AST node (or undefined if not captured). */
 export type CaptureMap = Record<string, SyntaxNode | undefined>;
 
+export interface DefinitionPropertiesContext {
+  readonly nodeLabel: NodeLabel;
+  readonly nodeName: string;
+  readonly definitionNode: SyntaxNode;
+  readonly parsedImports: readonly ParsedImport[];
+  readonly isExported: boolean;
+}
+
+export type DefinitionPropertiesExtractor = (
+  context: DefinitionPropertiesContext,
+) => Readonly<Record<string, unknown>> | undefined;
+
+/** Run optional provider enrichment without allowing one hook failure to drop
+ * the rest of the worker's language batch. */
+export function runDefinitionPropertiesExtractor(
+  extractor: DefinitionPropertiesExtractor,
+  context: DefinitionPropertiesContext,
+  onError: (error: unknown) => void,
+): Readonly<Record<string, unknown>> | undefined {
+  try {
+    return extractor(context);
+  } catch (error) {
+    onError(error);
+    return undefined;
+  }
+}
+
+/** Provider metadata is additive; graph identity and source-location fields
+ * supplied by the worker remain authoritative. */
+export function mergeCanonicalDefinitionProperties<
+  TCanonical extends Readonly<Record<string, unknown>>,
+>(
+  providerProperties: Readonly<Record<string, unknown>>,
+  canonicalProperties: TCanonical,
+): Record<string, unknown> & TCanonical {
+  return { ...providerProperties, ...canonicalProperties } as Record<string, unknown> & TCanonical;
+}
+
 // ── Strategy tag types ─────────────────────────────────────────────────────
 // NOTE: `MroStrategy` is defined in `gitnexus-shared` and re-exported above
 // so `core/ingestion/model/resolve.ts` can consume it without importing from
 // this file (which would pull in the full language-registry dependency graph).
-
-/**
- * How a language handles imports — determines wildcard synthesis behavior.
- *
- * Import resolution is a graph-traversal policy with multiple distinct strategies,
- * analogous to MRO for method resolution. Each tag picks a strategy:
- *
- * | Tag                   | Mechanism                                      | Traversal           | Languages                                  |
- * |-----------------------|------------------------------------------------|---------------------|--------------------------------------------|
- * | `named`               | Per-symbol imports                             | None (use-site)     | JS/TS, Java, C#, Rust, PHP, Kotlin, Vue    |
- * | `wildcard-transitive` | Textual paste, symbols chain through files     | BFS closure         | C, C++ (future: Obj-C, Fortran, Nim)       |
- * | `wildcard-leaf`       | Whole public API, single hop                   | None (direct only)  | Go, Ruby, Swift, Dart                      |
- * | `namespace`           | Qualified handle; symbols resolved at call site| None at import      | Python                                     |
- * | `explicit-reexport`   | Opt-in per-symbol re-export (SCAFFOLD)         | Topological DAG     | (future: TS `export *`, Rust `pub use`)    |
- *
- * The `explicit-reexport` tag is a compile-time scaffold; no provider claims it yet.
- * It falls through to `wildcard-leaf` behavior in synthesis so today's TS/Rust
- * handling is unchanged. A future PR will implement the DAG walk for `export *`.
- */
-export type ImportSemantics =
-  | 'named'
-  | 'wildcard-transitive'
-  | 'wildcard-leaf'
-  | 'namespace'
-  | 'explicit-reexport';
 
 /** Configuration for AST-based framework detection patterns. */
 export interface AstFrameworkPatternConfig {
@@ -91,6 +107,25 @@ export interface AstFrameworkPatternConfig {
  * Required fields must be explicitly set; optional fields have defaults
  * applied by defineLanguage().
  */
+/**
+ * Should the parse worker run {@link LanguageProviderConfig.extractModuleConstants}
+ * on this file?
+ *
+ * Exported so the DECISION is testable without booting a worker. It encodes the
+ * one rule that is easy to get backwards: a provider that declares no
+ * `moduleConstantHeuristic` harvests unconditionally. Writing the gate as
+ * `provider.moduleConstantHeuristic?.(content)` reads `undefined` as "skip" and
+ * silently disables the hook for every provider without a heuristic — which is
+ * exactly how Python's already-shipped harvest was turned off (#2391/#2980).
+ */
+export function shouldHarvestModuleConstants(
+  provider: Pick<LanguageProvider, 'extractModuleConstants' | 'moduleConstantHeuristic'>,
+  content: string,
+): boolean {
+  if (!provider.extractModuleConstants) return false;
+  return !provider.moduleConstantHeuristic || provider.moduleConstantHeuristic(content);
+}
+
 interface LanguageProviderConfig {
   // ── Identity ──────────────────────────────────────────────────────
   readonly id: SupportedLanguages;
@@ -141,9 +176,17 @@ interface LanguageProviderConfig {
    * The current C++ UE-macro preprocessor relies on the practical fact that
    * UE reflection macros and module-export tokens are ASCII-only.
    *
-   * Must be a pure function — same input always yields the same output. Called
-   * once per file, on every code path that re-parses (parsing-processor, import
-   * processor, heritage processor, call processor, parse worker).
+   * Must be a pure function — same input always yields the same output, and
+   * re-applying it to its own output changes nothing.
+   *
+   * Applied by the parse worker (`parse-worker.ts`), by `extractParsedFile`
+   * (`scope-extractor-bridge.ts`) on the parse-cache-miss path, and by the
+   * embedding parse (`embeddings/ast-utils.ts`, which does not go through the
+   * bridge). Any *new* path that re-parses a file must apply it too, or the two
+   * halves of the pipeline analyze different programs — and note the set is not
+   * closed today: language-owned re-parse helpers reached through other
+   * provider hooks (e.g. `populateRangeBindings`) still see raw text.
+   * `test/unit/preprocess-source-parity.test.ts` pins the bridge equivalence.
    *
    * Default: undefined (no preprocessing — `file.content` is parsed verbatim).
    */
@@ -161,31 +204,10 @@ interface LanguageProviderConfig {
   /** Call routing for languages that express imports/heritage as calls (e.g., Ruby).
    *  Default: no routing (all calls are normal call expressions). */
   readonly callRouter?: CallRouter;
-  /** Named binding extraction from import statements.
-   *  Default: undefined (language uses wildcard/whole-module imports). */
-  readonly namedBindingExtractor?: NamedBindingExtractorFn;
-  /** How this language handles imports. See `ImportSemantics` for the full taxonomy.
-   *  - 'named': per-symbol imports (JS/TS, Java, C#, Rust, PHP, Kotlin)
-   *  - 'wildcard-transitive': textual-include closure; imports chain through files (C, C++)
-   *  - 'wildcard-leaf': whole-module single-hop imports; no transitive chaining (Go, Ruby, Swift, Dart)
-   *  - 'namespace': qualified namespace imports, needs moduleAliasMap (Python)
-   *  - 'explicit-reexport': opt-in per-symbol re-export (scaffold; no provider uses yet)
-   *  Default: 'named'. */
-  readonly importSemantics?: ImportSemantics;
   /** Language-specific transformation of raw import path text before resolution.
    *  Called after sanitization. E.g., Kotlin appends wildcard suffixes.
    *  Default: undefined (no preprocessing). */
   readonly importPathPreprocessor?: (cleaned: string, importNode: SyntaxNode) => string;
-  /** Wire implicit inter-file imports for languages where all files in a module
-   *  see each other (e.g., Swift targets, C header inclusion units).
-   *  Called with only THIS language's files (pre-grouped by the processor).
-   *  Default: undefined (no implicit imports). */
-  readonly implicitImportWirer?: (
-    languageFiles: string[],
-    importMap: ReadonlyMap<string, ReadonlySet<string>>,
-    addImportEdge: (src: string, target: string) => void,
-    projectConfig: unknown,
-  ) => void;
 
   // ── Enclosing owner resolution ─────────────────────────────────
   /** Resolve a container node during enclosing-owner tree walks.
@@ -238,6 +260,12 @@ interface LanguageProviderConfig {
    * `undefined` when no constraints exist / the node isn't a templated
    * function. Languages without SFINAE / concept semantics leave this
    * undefined and the disambiguation is a pass-through.
+   *
+   * Cloneability contract: the returned payload crosses the worker boundary
+   * via structured clone, so it MUST be structured-clone-safe (no functions,
+   * symbols, or tree-sitter `SyntaxNode`s — only plain data). Wrap the return
+   * with `assertCloneable` from `workers/clone-safety.ts` so a future leak is a
+   * compile error at the source instead of a runtime DataCloneError (#2143).
    */
   readonly extractTemplateConstraints?: (definitionNode: SyntaxNode) => unknown;
 
@@ -248,13 +276,21 @@ interface LanguageProviderConfig {
    *  Default: undefined (standard label assignment). */
   readonly labelOverride?: (functionNode: SyntaxNode, defaultLabel: NodeLabel) => NodeLabel | null;
 
-  // ── Heritage & MRO ────────────────────────────────────────────────
-  /** Default edge type when parent symbol is ambiguous (interface vs class).
-   *  Default: 'EXTENDS'. */
-  readonly heritageDefaultEdge?: 'EXTENDS' | 'IMPLEMENTS';
-  /** Regex to detect interface names by convention (e.g., /^I[A-Z]/ for C#/Java).
-   *  When matched, IMPLEMENTS edge is used instead of heritageDefaultEdge. */
-  readonly interfaceNamePattern?: RegExp;
+  /**
+   * Suppress a definition query match after its default label is known.
+   * Languages use this for syntax that represents an implicit declaration
+   * unless an explicit declaration with the same semantics is present.
+   *
+   * `defaultLabel` is supplied so an implementation can scope itself to one
+   * kind of definition; implementations whose capture map alone decides the
+   * question may ignore it.
+   */
+  readonly shouldSkipDefinitionCapture?: (
+    captureMap: CaptureMap,
+    defaultLabel: NodeLabel,
+  ) => boolean;
+
+  // ── MRO ───────────────────────────────────────────────────────────
   /** MRO strategy for multiple inheritance resolution.
    *  Default: 'first-wins'. */
   readonly mroStrategy?: MroStrategy;
@@ -278,17 +314,14 @@ interface LanguageProviderConfig {
    *  constant, and static declarations. Produces VariableInfo with type, visibility,
    *  isConst, isStatic, isMutable metadata. Default: undefined (no variable extraction). */
   readonly variableExtractor?: VariableExtractor;
+  /** Add language-owned, structured properties to a definition node. Values
+   *  cross the worker boundary and must therefore be structured-clone-safe.
+   *  Shared ingestion code treats these properties as opaque. */
+  readonly definitionPropertiesExtractor?: DefinitionPropertiesExtractor;
   /** Class/type extractor for deriving canonical qualified names for class-like symbols.
    *  Uses the same provider-driven strategy pattern as method/field extraction so
    *  namespace/package/module rules stay language-specific. */
   readonly classExtractor?: ClassExtractor;
-  /** Heritage extractor for extracting extends/implements/trait-impl relationships
-   *  from tree-sitter @heritage.* captures and call-based heritage (e.g., Ruby
-   *  include/extend/prepend). Produced by createHeritageExtractor() — pass a
-   *  SupportedLanguages value for default behaviour or a full
-   *  HeritageExtractionConfig for languages with custom hooks (Go, Ruby).
-   *  All tree-sitter providers MUST supply this. */
-  readonly heritageExtractor?: HeritageExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */
@@ -297,73 +330,129 @@ interface LanguageProviderConfig {
     nodeName: string,
     captureMap: CaptureMap,
   ) => string | undefined;
-  /** Detect if a file contains framework route definitions (e.g., Laravel routes.php).
-   *  When true, the worker extracts routes via the language's route extraction logic.
+  /** Detect if a file contains single-file framework route definitions
+   *  (e.g., Laravel `routes/*.php`). When true, the parse worker extracts
+   *  routes from that file in isolation via the worker's route logic.
    *  Default: undefined (no route files). */
   readonly isRouteFile?: (filePath: string) => boolean;
-
-  // ── Call-resolution DAG hooks ─────────────────────────────────────
-  /**
-   * DAG stage 3 hook: synthesize an implicit receiver when the call site omits one.
-   *
-   * Runs after shared inference (TypeEnv → constructor-map → class-as-receiver →
-   * mixed-chain). Return an `ImplicitReceiverOverride` to overlay all fields onto
-   * `ReceiverEnriched`; return null to keep current state and proceed to stage 4.
-   *
-   * Constraints: MUST return null when an explicit receiver is already set, at
-   * top-level scope, or for built-in methods. Do not mutate input params.
-   * `hint` is opaque to shared stages; consumed by this language's `selectDispatch`.
-   *
-   * Ruby example: bare `serialize` in `Account#call_serialize` →
-   * `{ callForm: 'member', receiverName: 'self', receiverTypeName: 'Account',
-   *    receiverSource: 'implicit-self', hint: 'instance' }`
-   *
-   * @see call-types.ts § ImplicitReceiverOverride
-   * @see selectDispatch (stage 4, reads the hint)
-   *
-   * Default: undefined (no implicit-receiver inference).
-   */
-  readonly inferImplicitReceiver?: (params: {
-    readonly calledName: string;
-    readonly callForm: 'free' | 'member' | 'constructor' | undefined;
-    readonly receiverName: string | undefined;
-    readonly receiverTypeName: string | undefined;
-    readonly callNode: SyntaxNode;
-    readonly filePath: string;
-  }) => ImplicitReceiverOverride | null;
+  /** Discover the root route file(s) for a whole-repo, cross-file routing
+   *  framework (e.g. Django: manage.py → settings → ROOT_URLCONF → root urls.py).
+   *  Runs once on the main thread after all files are scanned. `reader` resolves
+   *  arbitrary repo-relative paths (in-memory map, then disk) so discovery never
+   *  depends on which parse chunk a file landed in. Returns one repo-relative
+   *  path per discoverable project (empty when the framework is absent) — a
+   *  monorepo with several projects yields each project's root.
+   *  Pairs with `extractRoutes`; languages with this hook are skipped by the
+   *  worker's single-file `isRouteFile` path. */
+  readonly discoverRootRouteFiles?: (
+    files: Array<{ path: string; content?: string }>,
+    contentMap?: Map<string, string>,
+    reader?: (relativePath: string) => string | null,
+  ) => string[];
+  /** Extract routes from a root route file, following cross-file includes via
+   *  `reader`. Runs on the main thread (never in the worker, which has no
+   *  filesystem access). `parser` is a tree-sitter parser preloaded with this
+   *  language's grammar, available for re-parsing included files.
+   *  Default: undefined (no route extraction). */
+  readonly extractRoutes?: (
+    tree: Parser.Tree,
+    filePath: string,
+    reader: (relativePath: string) => string | null,
+    parser?: Parser | null,
+  ) => ExtractedRoute[];
 
   /**
-   * DAG stage 4 hook: decide dispatch strategy (primary path, fallback, MRO view).
+   * Extract routes that a parsed file declares in its own AST.
    *
-   * Runs after stage 3. Return a `DispatchDecision` to override shared defaults;
-   * return null to use `defaultDispatchDecision` (constructor→`'constructor'`,
-   * member→`'owner-scoped'`, free→`'free'`). Most languages return null.
+   * When defined, the parse worker calls this after per-file capture processing
+   * to extract route definitions that require AST-level analysis beyond
+   * generic `@decorator` captures (e.g., Java Spring class-level prefix joining,
+   * multi-class handling). The returned routes are appended to `decoratorRoutes`.
    *
-   * The hook is responsible for its own gating. `ancestryView` only affects
-   * `'ruby-mixin'` strategy. Singleton-ancestry miss NEVER falls through to
-   * file-scoped fallback in stage 5 (enforced in resolveCallTarget).
+   * Decorators are the common case and the reason for the name, but not the only
+   * shape: JS/TS uses this hook for hand-rolled dispatch guards
+   * (`route-extractors/dispatch-guard.ts`), where a raw `node:http` server
+   * declares a route by comparing the request path to a literal. Anything that
+   * yields a `(path, verb, handler)` triple from one file's AST belongs here —
+   * set `ExtractedDecoratorRoute.source` when the provenance is not a decorator,
+   * so the `HANDLES_ROUTE` edge does not claim one.
    *
-   * Ruby examples:
-   * - `receiverSource='implicit-self', hint='instance'` →
-   *   `{primary: 'owner-scoped', fallback: 'free-arity-narrowed', ancestryView: 'instance'}`
-   * - `receiverSource='class-as-receiver'` →
-   *   `{primary: 'owner-scoped', ancestryView: 'singleton'}` (miss null-routes)
-   * - `receiverSource='implicit-self', hint='singleton'` →
-   *   `{primary: 'owner-scoped', fallback: 'free-arity-narrowed', ancestryView: 'singleton'}`
-   *
-   * @see call-types.ts § DispatchDecision
-   * @see call-processor.ts § defaultDispatchDecision, resolveCallTarget
-   *
-   * Default: undefined (use `defaultDispatchDecision`).
+   * Default: undefined (no language-specific route extraction).
    */
-  readonly selectDispatch?: (params: {
-    readonly calledName: string;
-    readonly callForm: 'free' | 'member' | 'constructor' | undefined;
-    readonly receiverName: string | undefined;
-    readonly receiverTypeName: string | undefined;
-    readonly receiverSource: ReceiverEnriched['receiverSource'];
-    readonly hint: string | undefined;
-  }) => DispatchDecision | null;
+  readonly extractDecoratorRoutes?: (
+    tree: Parser.Tree,
+    filePath: string,
+    lineOffset: number,
+  ) => ExtractedDecoratorRoute[];
+
+  /**
+   * Collect a project-wide, language-agnostic view of route-defining
+   * class/interface declarations (`SharedSpringType`) from a parsed file.
+   *
+   * When defined, the parse worker calls this per file and the parse phase
+   * aggregates the results, then runs a cross-file pass that resolves
+   * interface-inherited routes (a concrete controller inherits the `@*Mapping`s
+   * its interfaces declare) and appends them to `decoratorRoutes`. Separate from
+   * `extractDecoratorRoutes` because inheritance needs all files, not one.
+   *
+   * Default: undefined (no interface-inheritance route resolution).
+   */
+  readonly extractRouteInheritanceTypes?: (
+    tree: Parser.Tree,
+    filePath: string,
+  ) => SharedSpringType[];
+
+  /**
+   * Harvest this file's module-level string constants (#2391 core, #2980 Java
+   * parity) into the language-agnostic {@link ModuleConstants} shape, so the
+   * parse phase can resolve non-literal decorator route paths cross-file.
+   *
+   * The worker calls this when BOTH hold:
+   *  - the provider declares no `moduleConstantHeuristic`, or the one it
+   *    declares matched — syntax-driven, e.g. a `static final String` field or
+   *    a constants-bearing import; NEVER a class-name pattern like
+   *    `*Constants`, which silently drops route constants living in classes
+   *    named e.g. `ApiPaths`/`Routes`, and
+   *  - the extraction yields something resolvable (a literal, an expression, or
+   *    an import binding), keeping the aggregate bounded on large repos.
+   *
+   * Default: undefined (no constant harvest; non-literal route paths of this
+   * language floor to skip).
+   */
+  readonly extractModuleConstants?: (tree: Parser.Tree) => ModuleConstants;
+
+  /**
+   * Cheap content heuristic deciding whether the worker should run
+   * {@link extractModuleConstants} on a file. Guards the harvest cost on huge
+   * repos: files that cannot contribute (no constant-bearing syntax) are not
+   * walked. Must be syntax-driven (field/import shape), not identifier
+   * pattern-matching on class names.
+   *
+   * Default: undefined — harvest EVERY file of this language. A gate is opt-in
+   * because getting it wrong silently drops routes that already resolve, and a
+   * missed gate only costs time. Declare one only where the cost bites (Java's
+   * Maven monorepos) and only after checking it against every shape
+   * {@link extractModuleConstants} accepts.
+   */
+  readonly moduleConstantHeuristic?: (content: string) => boolean;
+
+  /**
+   * Fold one file's non-literal route-path operand list
+   * (`routePathExpr`/`routePathOperands` of an `ExtractedDecoratorRoute`)
+   * against the repo-wide, file-path-keyed constant map, or null when it cannot
+   * be fully folded (skip floor — never a phantom path). Languages whose
+   * qualified refs resolve through class imports (`Outer.CONST`,
+   * `com.example.ApiPaths.USERS`) need this hook because the shared fold has no
+   * notion of qualified names; Python's bare-name refs use the shared default.
+   *
+   * Default: undefined (the parse phase falls back to the shared
+   * language-agnostic operand fold).
+   */
+  readonly foldRoutePathOperands?: (
+    filePath: string,
+    operands: readonly Operand[],
+    repo: RepoConstants,
+  ) => string | null;
 
   // ── Noise filtering ────────────────────────────────────────────────
   /** Built-in/stdlib names that should be filtered from the call graph for this language.
@@ -400,9 +489,8 @@ interface LanguageProviderConfig {
    * routing (scope / declaration / import / type-binding / reference)
    * lands on coherent records.
    *
-   * Required for any provider participating in scope-based resolution.
-   * Providers that have not yet migrated continue to run through the
-   * legacy DAG path (feature-flagged per `REGISTRY_PRIMARY_<LANG>`).
+   * Required for any provider participating in scope-based resolution
+   * (the sole resolution path).
    *
    * **Sync return.** Tree-sitter query execution and COBOL's regex
    * tagger are both synchronous; no current or foreseeable provider
@@ -410,7 +498,7 @@ interface LanguageProviderConfig {
    * `parse-worker.ts` (#920) invoke it inline in its already-sync
    * per-file loop without cascading `async` through the batch pipeline.
    *
-   * Default: undefined (language continues to use legacy DAG).
+   * Default: undefined (no scope-based captures emitted for this language).
    */
   readonly emitScopeCaptures?: (
     sourceText: string,
@@ -426,7 +514,56 @@ interface LanguageProviderConfig {
      * MUST trigger a fresh parse.
      */
     cachedTree?: unknown,
+    /**
+     * Optional metadata about how `sourceText` was produced.
+     *
+     * Most providers ignore this and treat `sourceText` as full file content.
+     * Vue uses it to distinguish:
+     *   - `full-file`: full `.vue` SFC source
+     *   - `pre-extracted-script`: worker-preprocessed bare `<script>` content
+     *
+     * Default: `{ sourceKind: 'full-file' }`.
+     */
+    sourceMeta?: {
+      readonly sourceKind?: 'full-file' | 'pre-extracted-script';
+    },
   ) => readonly CaptureMatch[];
+
+  /**
+   * Snapshot the capture-time side-channel state that this provider's
+   * `emitScopeCaptures` just populated for `filePath` into module-level maps,
+   * returning a plain JSON-serializable value (or `undefined` when there is
+   * nothing to carry).
+   *
+   * Called in the parse worker IMMEDIATELY after `emitScopeCaptures` runs for
+   * a file (see `parse-worker.ts`), and the result is stored on the produced
+   * `ParsedFile.captureSideChannel`. Scope-resolution on the main thread reuses
+   * that serialized `ParsedFile` and skips re-extraction (#1983), so this hook
+   * is how the worker-computed marks survive the worker→main boundary and the
+   * disk store WITHOUT a main-thread re-parse. The main thread restores them
+   * via the matching `ScopeResolver.applyCaptureSideChannel` hook.
+   *
+   * Cloneability contract: MUST return plain data (objects / arrays /
+   * primitives — no functions, symbols, or tree-sitter `SyntaxNode`s) so it
+   * survives BOTH the worker→main structured clone AND `JSON.stringify` + the
+   * parsedfile-store interning reviver. Wrap the return with `assertCloneable`
+   * from `workers/clone-safety.ts` so a future non-serializable leak is a
+   * compile error at the source instead of a runtime DataCloneError (#2143).
+   *
+   * Default: undefined (provider has no capture-time module-level side effects).
+   */
+  readonly collectCaptureSideChannel?: (filePath: string) => unknown;
+
+  /**
+   * Per-language control-flow-graph builder (#2081 M1, PDG/taint substrate).
+   * Invoked IN THE PARSE WORKER (where the AST lives) for each function node,
+   * gated on the `--pdg` opt-in; the resulting per-function CFGs are serialized
+   * onto `ParsedFile.cfgSideChannel` and emitted as BasicBlock nodes + CFG
+   * edges during scope-resolution. `TNode` is `SyntaxNode` for the tree-sitter
+   * languages. Default: undefined (language has no CFG support yet — TS/JS are
+   * the M1 set).
+   */
+  readonly cfgVisitor?: CfgVisitor<SyntaxNode>;
 
   /**
    * Interpret a raw `@import.statement` capture group into a `ParsedImport`.
@@ -437,6 +574,94 @@ interface LanguageProviderConfig {
    * Required when `emitScopeCaptures` is implemented.
    */
   readonly interpretImport?: (captures: CaptureMatch) => ParsedImport | null;
+
+  /**
+   * Do this language's imports EXECUTE at the point in the program where they
+   * are written?
+   *
+   * The scope extractor marks an import `runsOnlyWhenCalled` when the statement
+   * sits inside a `Function` scope (Pass 3): where imports are executed
+   * statements, one written in a function body runs only when that function is
+   * called — Python's `def f(): from x import Y`, Ruby's
+   * `def f; require 'x'; end`, a CommonJS `require()` in a body (which
+   * `javascript/captures.ts` does capture, via its own AST walk). That rule is
+   * about EXECUTION. It says nothing true about a language whose "import" is
+   * not an executed statement at all, and in such a language moving one into a
+   * function body defers exactly nothing.
+   *
+   * "Where written" is about execution time, not textual placement: a
+   * `#include` is spliced precisely where it is written and still answers
+   * `false`, because splicing is not running.
+   *
+   * **The failure directions are not symmetric, which is why the default is
+   * what it is.** Answering `false` for a language that really does execute
+   * its imports un-defers a deliberately lazy one, and `check --cycles`
+   * reports a cycle its author broke on purpose — wrong, but visible on screen
+   * and arguable by whoever reads it. Answering `true` for a language that
+   * does not SUPPRESSES a cycle that is entirely real: nobody sees it, so
+   * nobody can argue with it. Getting this wrong in the `true` direction hides
+   * a true cycle, and that is the failure that matters.
+   *
+   * Absent — the default — reads as `true`, so every provider that does not
+   * name this keeps today's behaviour exactly. The flag never ADDS deferral;
+   * declaring `false` only WITHHOLDS it.
+   *
+   * Declared `false` by, and only by:
+   *
+   *   - **C and C++** — `#include` is a preprocessor directive. The header's
+   *     text is spliced in before a line of the program runs, wherever the
+   *     directive sits, and C permits one inside a function body. C++'s only
+   *     other Pass-3 import form, `using ns::name` / `using namespace ns`, is
+   *     compile-time name lookup, is legal in a function body too, and defers
+   *     no more than an `#include` does.
+   *   - **Rust** — `use` is a compile-time path alias, not a statement that
+   *     runs. `fn f() { use crate::m::X; }` is legal, and putting the `use`
+   *     there changes only where the name is VISIBLE, never when anything
+   *     happens; Rust has no module-initialization order in the JS/Python
+   *     sense and permits intra-crate module cycles outright. It is the
+   *     structural twin of C++'s `using ns::name`. `rust/query.ts` captures
+   *     `(use_declaration)` and nothing else, so this covers the whole
+   *     surface. (The claim here is the narrow one: POSITION does not defer a
+   *     Rust import. Whether a Rust `use` can create an initialization
+   *     dependency *at all* is a larger and separate question, and this flag
+   *     deliberately does not answer it.)
+   *   - **COBOL** — `COPY` is a pure textual splice performed by the copybook
+   *     preprocessor, the `#include` case exactly. Latent today: the COBOL
+   *     `@scope.function` capture covers a single line (`cobol/captures.ts`
+   *     ranges sections and paragraphs `line → line`), so a `COPY` on any
+   *     later line never resolves inside one and Pass 3 has nothing to mark.
+   *     Declared anyway, so that giving those anchors their true multi-line
+   *     ranges cannot silently start suppressing real copybook cycles.
+   *
+   * Per-provider rather than per-import, and that is sufficient — the question
+   * this answers is narrower than "do this language's imports execute". It is
+   * only ever asked of an import that resolved INSIDE A FUNCTION SCOPE, so the
+   * real domain is: *can a function-local import in this language be
+   * non-executing?* No supported language has two forms that are both
+   * function-local and disagree. C++ has two forms, `#include` and
+   * `using ns::name`; both can appear in a body and both are compile-time.
+   *
+   * PHP is the case that looks like a counterexample and is not. It does mix —
+   * `use Foo\Bar;` aliases at compile time while `require` executes — but
+   * `use` cannot appear in a function body at all (`php/query.ts` records this
+   * twice: "`namespace_use_declaration` is an import only at top level / inside
+   * namespace scope"), so it never reaches this flag. Absent is therefore
+   * PERMANENTLY correct for PHP, including the day `require` is captured: a
+   * `require` in a body will correctly defer, and a `use` still cannot get
+   * here. Do not read PHP as a reason to build a per-`ParsedImport`
+   * classification hook — it would cost a provider call per import on the
+   * extractor's hot path, and `ParsedImport.kind` does not discriminate the
+   * thing being asked anyway.
+   *
+   * A capability on the provider rather than a language check in
+   * `scope-extractor.ts`: shared `core/ingestion/` pipeline code must not name
+   * languages (AGENTS.md), and "imports here are not executed statements" is a
+   * property of the language, not of the walk.
+   *
+   * Default: undefined, read as `true` (imports execute where they are
+   * written; position defers them).
+   */
+  readonly importsExecuteWhereWritten?: boolean;
 
   /**
    * What is the implicit receiver on a Function scope? For instance methods
@@ -468,6 +693,20 @@ interface LanguageProviderConfig {
    * suffix — `@scope.function` → `'Function'`, etc.).
    */
   readonly resolveScopeKind?: (captures: CaptureMatch) => ScopeKind | null;
+
+  /**
+   * Report the receiver names this scope BINDS rather than inherits — see
+   * `Scope.ownsReceivers` (#2701).
+   *
+   * Called once per `@scope.*` capture during scope-tree construction.
+   * Return the shared frozen set for a scope that starts a fresh receiver
+   * (a JS/TS ordinary `function`, whose `this` is bound at call time), and
+   * `undefined` for one that inherits it (an arrow function, and every
+   * closure form in languages that capture the receiver lexically).
+   *
+   * Default: undefined everywhere — the receiver walk is unchanged.
+   */
+  readonly scopeOwnsReceivers?: (captures: CaptureMatch) => ReadonlySet<string> | undefined;
 
   /**
    * Override where a declaration's name becomes visible. By default the name
@@ -508,7 +747,7 @@ interface LanguageProviderConfig {
   readonly resolveImportTarget?: (
     parsedImport: ParsedImport,
     workspaceIndex: WorkspaceIndex,
-  ) => string | null;
+  ) => string | readonly string[] | null;
 
   /**
    * Enumerate the exported names of a file — used by the finalize algorithm
@@ -609,23 +848,15 @@ interface LanguageProviderConfig {
 }
 
 /** Runtime type — same as LanguageProviderConfig but with defaults guaranteed present. */
-export interface LanguageProvider extends Omit<
-  LanguageProviderConfig,
-  'importSemantics' | 'heritageDefaultEdge' | 'mroStrategy'
-> {
-  readonly importSemantics: ImportSemantics;
-  readonly heritageDefaultEdge: 'EXTENDS' | 'IMPLEMENTS';
+export interface LanguageProvider extends Omit<LanguageProviderConfig, 'mroStrategy'> {
   readonly mroStrategy: MroStrategy;
   /** Check if a name is a built-in/stdlib function that should be filtered from the call graph. */
   readonly isBuiltInName: (name: string) => boolean;
 }
 
-const DEFAULTS: Pick<LanguageProvider, 'importSemantics' | 'heritageDefaultEdge' | 'mroStrategy'> =
-  {
-    importSemantics: 'named',
-    heritageDefaultEdge: 'EXTENDS',
-    mroStrategy: 'first-wins',
-  };
+const DEFAULTS: Pick<LanguageProvider, 'mroStrategy'> = {
+  mroStrategy: 'first-wins',
+};
 
 /** Define a language provider — required fields must be supplied, optional fields get sensible defaults. */
 export function defineLanguage(config: LanguageProviderConfig): LanguageProvider {

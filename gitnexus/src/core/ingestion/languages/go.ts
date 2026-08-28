@@ -5,13 +5,14 @@
  * LanguageProvider, following the Strategy pattern used by the pipeline.
  *
  * Key Go traits:
- *   - importSemantics: 'wildcard-leaf' (Go imports entire packages)
  *   - callRouter: present (Go method calls may need routing)
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { goClassConfig } from '../class-extractors/configs/go.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
+import { createGoCfgVisitor } from '../cfg/visitors/go.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as goConfig } from '../type-extractors/go.js';
 import { goExportChecker } from '../export-detection.js';
@@ -27,8 +28,6 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { goVariableConfig } from '../variable-extractors/configs/go.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { goCallConfig } from '../call-extractors/configs/go.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
-import { goHeritageConfig } from '../heritage-extractors/configs/go.js';
 import {
   emitGoScopeCaptures,
   goArityCompatibility,
@@ -135,17 +134,31 @@ export const goProvider = defineLanguage({
   typeConfig: goConfig,
   exportChecker: goExportChecker,
   importResolver: createImportResolver(goImportConfig),
-  importSemantics: 'wildcard-leaf',
   callExtractor: createCallExtractor(goCallConfig),
   fieldExtractor: createFieldExtractor(goFieldConfig),
   methodExtractor: createMethodExtractor(goMethodConfig),
   variableExtractor: createVariableExtractor(goVariableConfig),
   classExtractor: createClassExtractor(goClassConfig),
-  heritageExtractor: createHeritageExtractor(goHeritageConfig),
+  // ── godoc (`//` leading comments) → description (issue #2270). Build/tool
+  //    directives (//go:…, // +build, //nolint, //line) are not documentation. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    lineCommentPrefixes: ['//'],
+    lineDirectivePrefixes: ['//go:', '// +build', '//nolint', '//line'],
+    // #2837: Go type declarations anchor on the `type_spec`, whose
+    // `previousNamedSibling` is null for the ordinary `type T struct{…}` form —
+    // the godoc comment is a sibling of the enclosing `type_declaration`, one
+    // level up. Without this the doc silently vanished for EVERY Go struct and
+    // interface (measured: pre-#2837 `desc=YES`, post `none`), taking #2270's
+    // description out of both the embedding header and the FTS column.
+    // Functions/methods are unaffected — they anchor on their own declaration
+    // node, which does carry the comment as a previous sibling.
+    wrapperNodeTypes: ['type_declaration'],
+  }),
   builtInNames: GO_BUILT_INS,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks ──────────
   emitScopeCaptures: emitGoScopeCaptures,
+  cfgVisitor: createGoCfgVisitor(),
   interpretImport: interpretGoImport,
   interpretTypeBinding: interpretGoTypeBinding,
   bindingScopeFor: goBindingScopeFor,

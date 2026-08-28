@@ -4,7 +4,14 @@
  * Note: Different grammars (typescript vs tsx vs javascript) may have
  * slightly different node types. These queries are designed to be
  * compatible with the standard tree-sitter grammars.
+ *
+ * Heritage (extends/implements/embed/trait) is NOT captured here. The legacy
+ * heritage-capture leg was removed (issue #942); inheritance edges are
+ * produced by the registry-primary scope-resolution path, which synthesizes
+ * `@reference.inherits` captures in each language's `languages/<lang>/captures.ts`.
  */
+
+import { ARRAY_METHOD_NOT_ANY_OF_PREDICATE } from './ts-js-hoc-utils.js';
 
 // TypeScript queries - works with tree-sitter-typescript
 export const TYPESCRIPT_QUERIES = `
@@ -17,7 +24,47 @@ export const TYPESCRIPT_QUERIES = `
 (interface_declaration
   name: (type_identifier) @name) @definition.interface
 
+; Type aliases (A4). TypeScript was the only language whose aliases minted no
+; node: Rust (type_item), Kotlin (type_alias), Swift (typealias_declaration)
+; and Dart all emit @definition.type. The alias was declared for scope
+; resolution but never became a graph symbol, so a context() lookup on an
+; exported API-contract type answered "Symbol not found".
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
+; Members of a declared SHAPE — interface bodies and object-type aliases both
+; spell them as property_signature, so one pattern covers both. A TS frontend
+; models its API contracts this way, and without these there is no graph path
+; from a contract field to the code that reads it.
+; ANCHORED to declared shapes. Unanchored, property_signature matches every
+; object_type in the grammar — an inline parameter type, an inline return
+; type, a nested object type — and the enclosing-container walk then hangs the
+; node off the nearest class/interface/alias. class Svc { retries = 1;
+; run(opts: { retries: number }) {} } minted Property:a.ts:Svc.retries twice,
+; and graph.addNode is first-write-wins, so two distinct symbols merged into
+; one and every context()/impact()/rename() answer about that field described
+; the merge. It also emitted the outright false Svc HAS_PROPERTY retries for a
+; field belonging to an anonymous parameter type.
+;
+; The sibling JS object-literal rule in this same PR is anchored for exactly
+; this reason; this is the TypeScript half of the same fix.
+;
+; (A (B)) matches DIRECT children, so a nested object type
+; (type Config = { host: string; db: { host: string } }) is excluded here as
+; well — its members are not direct children of the alias's own object_type.
+(interface_body
+  (property_signature
+    name: (property_identifier) @name) @definition.property)
+
+(type_alias_declaration
+  value: (object_type
+    (property_signature
+      name: (property_identifier) @name) @definition.property))
+
 (function_declaration
+  name: (identifier) @name) @definition.function
+
+(generator_function_declaration
   name: (identifier) @name) @definition.function
 
 ; TypeScript overload signatures (function_signature is a separate node type from function_declaration)
@@ -49,6 +96,18 @@ export const TYPESCRIPT_QUERIES = `
     name: (identifier) @name
     value: (function_expression))) @definition.function
 
+; Generator EXPRESSIONS bound to a name (\`const g = function* () {}\`). Without
+; these, the binding emitted a \`Const\` node rather than a \`Function\` one, so
+; \`g()\` resolved to nothing: \`buildGraphTargetIndex\` only admits a callable
+; node. Same construct and same binding semantics as the \`function_expression\`
+; rules directly above, so same label. Covers the four variable-binding shapes
+; (const/let and var, each plain and exported); a generator in an object-literal
+; pair or a HOC wrapper is NOT covered and still falls through anonymous.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (generator_function))) @definition.function
+
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
@@ -60,6 +119,50 @@ export const TYPESCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (generator_function)))) @definition.function
+
+; \`var\` closure bindings (#2693). The lexical rules above cover const/let;
+; \`var\` is a different grammar node, so \`var f = (x) => x\` kept a Variable
+; label while const/let got Function — and the CALLS edge that resolved through
+; the declaration route therefore pointed at a NON-callable node. Same construct,
+; same binding semantics for this purpose, so same label.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (arrow_function))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (function_expression))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (generator_function))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (arrow_function)))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (generator_function)))) @definition.function
 
 ; Object-property arrows / function expressions: \`{ addItem: () => ... }\`.
 ; The pair's key field carries the meaningful name. Without these patterns,
@@ -95,10 +198,17 @@ export const TYPESCRIPT_QUERIES = `
 ; \`tsExtractFunctionName\` for the resolution logic and the \`query.ts\`
 ; comment for the full anchor-discipline rationale and the chained-
 ; array-method trade-off.
+;
+; NOTE: Excludes member-expression calls to common array methods (map, filter,
+; reduce, etc.) to avoid false positives like \`const x = arr.map(a => ...)\`
+; being classified as a Function when it's actually a Const holding an array.
+; Direct identifier calls and member expressions on non-array-methods (like
+; React.memo) are still matched.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -106,14 +216,36 @@ export const TYPESCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
 
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (arrow_function)))))) @definition.function
 
@@ -122,15 +254,40 @@ export const TYPESCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (function_expression)))))) @definition.function
 
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
 ; \`var X = HOC(...)\` parity with registry-primary. Legacy code (and any
 ; transpiler output that downlevels \`const\` to \`var\`) hits this shape.
+; Same array-method exclusions as const/let patterns above.
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -138,8 +295,59 @@ export const TYPESCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+; HOC-wrapped default exports: \`export default defineEventHandler(async (e) => { ... })\`.
+; The worker rewrites the wrapper-derived @name to a file-derived symbol name
+; so helpers like \`defineEventHandler\` / \`React.memo\` do not collapse
+; unrelated modules onto the same Function name.
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
 
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
@@ -196,28 +404,147 @@ export const TYPESCRIPT_QUERIES = `
 (public_field_definition
   name: (property_identifier) @name) @definition.property
 
+; Object-literal keys of a NAMED object, and the same shape behind an
+; identity-preserving wrapper. Both rules existed only in JAVASCRIPT_QUERIES, so
+; a .ts file writing the single most common config idiom in the language —
+; const CONFIG = { retries: 3 } — minted no node for any key: context() answered
+; "Symbol not found" and a precise read through the holding variable had nothing
+; to resolve to.
+;
+; TypeScript sets fieldFallbackOnMethodLookup:false, so these do NOT gain
+; name-based inference; they gain the PRECISE path, which is the one TypeScript
+; is supposed to use. A read through an untyped receiver stays unresolved, and
+; is now reported as such rather than answering an empty set.
+;
+; Scoped exactly as the JavaScript rules are: bound to a variable, and for the
+; wrapper only the three functions that return the argument they were given.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (pair
+      key: (property_identifier) @name) @definition.property))
+
+; Keys of an ANONYMOUS object literal in RETURN position (R3-4). The dominant
+; shape in idiomatic JS: 437 sites in one backend directory of the reporting
+; repo, including the ~25-field payload of its whole signal pipeline, none of
+; which could be named because the literal binds to nothing.
+;
+; The enclosing function is the owner -- the literal is that function's return
+; shape, a contract its callers consume -- so the key qualifies as
+; <function>.<key> and two functions returning the same key stay distinct.
+;
+; DEFINITIONS, unlike the record-construction writes of R2-1b, and the
+; difference is deliberate: there a definition already existed elsewhere and a
+; construction site was a USE of it, while here nothing else names the field at
+; all. To keep that from regressing R2-1b's case, narrowing ranks declared
+; anchors ABOVE return shapes, so a name that already resolves keeps resolving
+; to what it resolved to before.
+(return_statement
+  (object
+    (pair
+      key: (property_identifier) @name) @definition.property))
+
+; SHORTHAND keys of the same literal. "return { symbol, interval, score }" is
+; the commonest spelling of all -- the reporting repo's own alert payload is
+; mostly shorthand -- and (pair) does not match it: tree-sitter models it as
+; shorthand_property_identifier, where the key IS the value. Found by dumping
+; the golden fixture and noticing that a literal returning
+; { level, message, timestamp: Date.now() } had indexed only timestamp.
+(return_statement
+  (object
+    (shorthand_property_identifier) @name @definition.property))
+
+; Shorthand keys of a named object literal -- same gap, same reason as the
+; return-position rule above.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (shorthand_property_identifier) @name @definition.property))
+
+(variable_declarator
+  name: (identifier)
+  value: (call_expression
+    function: (member_expression
+      object: (identifier) @_ts.identity.obj
+      property: (property_identifier) @_ts.identity.fn)
+    arguments: (arguments
+      (object
+        (pair
+          key: (property_identifier) @name) @definition.property)))
+  (#eq? @_ts.identity.obj "Object")
+  (#match? @_ts.identity.fn "^(freeze|seal|preventExtensions)$"))
+
 ; Private class fields: #address: Address
 (public_field_definition
   name: (private_property_identifier) @name) @definition.property
+
+; Closure-valued class fields (#2693): \`handler = (x) => x\` is a CALLABLE
+; member, so it emits Method like every other closure binding rather than a
+; Property that CALLS edges would point at — a call target must be callable.
+; Kotlin already models its class-body closure this way (Method + HAS_METHOD).
+;
+; Note this diverges from tsc's SymbolFlags and SCIP's descriptor, which both
+; class an arrow-initialized field as a PROPERTY/term. That is deliberate: the
+; label here means "is a call target", not "is a tsc symbol kind", and #2687 set
+; that convention for closure bindings in every language. Anchored on
+; public_field_definition — the same node the property rules use — so the
+; parse-worker dedup collapses the pair (callable ranks highest).
+(public_field_definition
+  name: (property_identifier) @name
+  value: (arrow_function)) @definition.method
+
+(public_field_definition
+  name: (property_identifier) @name
+  value: (function_expression)) @definition.method
+
+; CJS property-assignment exports (#2723) — see JAVASCRIPT_QUERIES for the
+; rationale and for why the receiver is pinned to \`exports\`/\`module.exports\`.
+; Mirrored here because \`.ts\` files in a CommonJS package use the same form.
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @_cjs.receiver
+    property: (property_identifier) @name)
+  right: [(function_expression) (arrow_function) (generator_function)]) @definition.function
+
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @_cjs.module
+      property: (property_identifier) @_cjs.exports)
+    property: (property_identifier) @name)
+  right: [(function_expression) (arrow_function) (generator_function)]
+  (#eq? @_cjs.module "module")
+  (#eq? @_cjs.exports "exports")) @definition.function
+
+; Instance members assigned through \`this\` (#2723 follow-up) — see
+; JAVASCRIPT_QUERIES for rationale.
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @name)
+  right: [
+    (function_expression)
+    (arrow_function)
+    (generator_function)
+  ]) @definition.function
+
+; Prototype methods (#2723 follow-up) — see JAVASCRIPT_QUERIES for rationale.
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      property: (property_identifier) @_proto.kw)
+    property: (property_identifier) @name)
+  right: [
+    (function_expression)
+    (arrow_function)
+    (generator_function)
+  ]
+  (#eq? @_proto.kw "prototype")) @definition.function
 
 ; Constructor parameter properties: constructor(public address: Address)
 (required_parameter
   (accessibility_modifier)
   pattern: (identifier) @name) @definition.property
-
-; Heritage queries - class extends
-(class_declaration
-  name: (type_identifier) @heritage.class
-  (class_heritage
-    (extends_clause
-      value: (identifier) @heritage.extends))) @heritage
-
-; Heritage queries - class implements interface
-(class_declaration
-  name: (type_identifier) @heritage.class
-  (class_heritage
-    (implements_clause
-      (type_identifier) @heritage.implements))) @heritage.impl
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -235,11 +562,18 @@ export const TYPESCRIPT_QUERIES = `
 
 ; HTTP consumers: fetch('/path'), axios.get('/path'), $.get('/path'), etc.
 ; fetch() — global function
+; The URL alternation is OPTIONAL (#2897). Requiring a literal made the rule
+; blind to fetch(url) with a variable argument -- measured on this repo, 44 of
+; 47 fetch calls pass one, so 94% of outward calls produced no site at all. The
+; R3-6 sink set needs only WHERE the program reaches outward, not the URL; route
+; linking still needs the URL and already skips an entry without one
+; (normalizeFetchURL returns nothing and processNextjsFetchRoutes continues), so
+; widening here adds sink sites without inventing a single FETCHES edge.
 (call_expression
   function: (identifier) @_fetch_fn (#eq? @_fetch_fn "fetch")
   arguments: (arguments
     [(string (string_fragment) @route.url)
-     (template_string) @route.template_url])) @route.fetch
+     (template_string) @route.template_url]?)) @route.fetch
 
 ; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
 (call_expression
@@ -276,6 +610,9 @@ export const JAVASCRIPT_QUERIES = `
 (function_declaration
   name: (identifier) @name) @definition.function
 
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 
@@ -293,6 +630,18 @@ export const JAVASCRIPT_QUERIES = `
     name: (identifier) @name
     value: (function_expression))) @definition.function
 
+; Generator EXPRESSIONS bound to a name (\`const g = function* () {}\`). Without
+; these, the binding emitted a \`Const\` node rather than a \`Function\` one, so
+; \`g()\` resolved to nothing: \`buildGraphTargetIndex\` only admits a callable
+; node. Same construct and same binding semantics as the \`function_expression\`
+; rules directly above, so same label. Covers the four variable-binding shapes
+; (const/let and var, each plain and exported); a generator in an object-literal
+; pair or a HOC wrapper is NOT covered and still falls through anonymous.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (generator_function))) @definition.function
+
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
@@ -304,6 +653,110 @@ export const JAVASCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (generator_function)))) @definition.function
+
+; \`var\` closure bindings (#2693). The lexical rules above cover const/let;
+; \`var\` is a different grammar node, so \`var f = (x) => x\` kept a Variable
+; label while const/let got Function — and the CALLS edge that resolved through
+; the declaration route therefore pointed at a NON-callable node. Same construct,
+; same binding semantics for this purpose, so same label.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (arrow_function))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (function_expression))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (generator_function))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (arrow_function)))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (variable_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (generator_function)))) @definition.function
+
+; CJS property-assignment exports (#2723): \`exports.foo = function () {}\`,
+; \`module.exports.foo = (a) => a\`. This is the dominant export style in
+; pre-ESM Node (Express, Firebase Functions), and without these rules a
+; CommonJS codebase indexed its internals while every symbol on its public
+; API was missing — \`impact\`/\`context\`/\`rename\` all answered "not found".
+;
+; Scoped to the \`exports\` / \`module.exports\` receivers on purpose. The
+; general \`X.foo = function () {}\` shape also covers \`Foo.prototype.bar\` and
+; \`this.handler\`, which are member constructs with their own ownership
+; questions (an owning Class, a function-local binding) — a broader rule
+; would emit ownerless top-level Functions for them. Same rationale as the
+; other closure-binding rules above: the label means "is a call target".
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @_cjs.receiver
+    property: (property_identifier) @name)
+  right: [(function_expression) (arrow_function) (generator_function)]) @definition.function
+
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @_cjs.module
+      property: (property_identifier) @_cjs.exports)
+    property: (property_identifier) @name)
+  right: [(function_expression) (arrow_function) (generator_function)]
+  (#eq? @_cjs.module "module")
+  (#eq? @_cjs.exports "exports")) @definition.function
+
+; Prototype methods (#2723 follow-up): \`Foo.prototype.bar = function () {}\`.
+; The dominant pre-ES6 method form, and previously invisible — no node at all,
+; so \`impact\` could not reach a single prototype method. Emitted as a MEMBER:
+; \`labelOverride\` reclassifies it to Method and the owner resolves to whatever
+; \`Foo\` names, so \`HAS_METHOD\` makes it reachable the way a class method is.
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      property: (property_identifier) @_proto.kw)
+    property: (property_identifier) @name)
+  right: [
+    (function_expression)
+    (arrow_function)
+    (generator_function)
+  ]
+  (#eq? @_proto.kw "prototype")) @definition.function
+
+; Instance members assigned through \`this\` (#2723 follow-up):
+; \`function Widget() { this.handler = function () {}; }\`. The pre-ES6 sibling
+; of a closure-valued class field, which #2693 already models as a Method.
+; Ownership resolves to the enclosing constructor/class; a \`this\` at module
+; top level owns nothing and stays a plain top-level definition.
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @name)
+  right: [
+    (function_expression)
+    (arrow_function)
+    (generator_function)
+  ]) @definition.function
 
 ; Object-property arrows / function expressions: \`{ addItem: () => ... }\`.
 ; See TYPESCRIPT_QUERIES for rationale (issue #1166).
@@ -329,10 +782,12 @@ export const JAVASCRIPT_QUERIES = `
 ; / debounce / user-defined HOC factories). Both \`const\` and \`var\` forms
 ; are mirrored so JS code that uses \`var\` (or transpiler output) gets the
 ; same attribution as the registry-primary path.
+; Excludes common array methods (map, filter, reduce, etc.) to avoid false positives.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -340,14 +795,36 @@ export const JAVASCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
 
 (export_statement
   declaration: (lexical_declaration
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (arrow_function)))))) @definition.function
 
@@ -356,14 +833,39 @@ export const JAVASCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (call_expression
+        function: (identifier)
         arguments: (arguments
           (function_expression)))))) @definition.function
 
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (arrow_function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        function: (member_expression
+          property: (property_identifier) @callee)
+        arguments: (arguments
+          (function_expression)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE}) @definition.function
+
 ; \`var X = HOC(...)\` parity with registry-primary.
+; Same array-method exclusions as const/let patterns.
 (variable_declaration
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function))))) @definition.function
 
@@ -371,8 +873,56 @@ export const JAVASCRIPT_QUERIES = `
   (variable_declarator
     name: (identifier) @name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression))))
+  (#not-any-of? @callee "map" "filter" "reduce" "forEach" "find" "findIndex" "some" "every" "flatMap" "sort" "splice" "slice" "concat" "fill" "copyWithin" "join" "flat" "at" "entries" "keys" "values" "indexOf" "lastIndexOf" "includes" "pop" "push" "shift" "unshift" "reverse" "reduceRight" "toSorted" "toReversed" "toSpliced" "with")) @definition.function
+
+; HOC-wrapped default exports (JS parity with TS patterns above).
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function)))) @definition.function
+
+ (export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression)))) @definition.function
 
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
@@ -412,12 +962,93 @@ export const JAVASCRIPT_QUERIES = `
 (field_definition
   property: (property_identifier) @name) @definition.property
 
-; Heritage queries - class extends (JavaScript uses different AST than TypeScript)
-; In tree-sitter-javascript, class_heritage directly contains the parent identifier
-(class_declaration
-  name: (identifier) @heritage.class
-  (class_heritage
-    (identifier) @heritage.extends)) @heritage
+; Object-literal keys of a NAMED object (A1/A5). Idiomatic JS models config as
+; an object literal, not a class, so without these the fields of an options bag
+; have no node and "who reads/writes this setting?" answers a confident zero.
+;
+; Deliberately scoped to a literal BOUND TO A VARIABLE. An unbound literal is
+; usually an inline call argument or a JSX prop bag, whose keys are call-site
+; data rather than a named surface other code references — minting a node per
+; key there would add volume without adding an answerable question.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (pair
+      key: (property_identifier) @name) @definition.property))
+
+; Keys of an ANONYMOUS object literal in RETURN position (R3-4). The dominant
+; shape in idiomatic JS: 437 sites in one backend directory of the reporting
+; repo, including the ~25-field payload of its whole signal pipeline, none of
+; which could be named because the literal binds to nothing.
+;
+; The enclosing function is the owner -- the literal is that function's return
+; shape, a contract its callers consume -- so the key qualifies as
+; <function>.<key> and two functions returning the same key stay distinct.
+;
+; DEFINITIONS, unlike the record-construction writes of R2-1b, and the
+; difference is deliberate: there a definition already existed elsewhere and a
+; construction site was a USE of it, while here nothing else names the field at
+; all. To keep that from regressing R2-1b's case, narrowing ranks declared
+; anchors ABOVE return shapes, so a name that already resolves keeps resolving
+; to what it resolved to before.
+(return_statement
+  (object
+    (pair
+      key: (property_identifier) @name) @definition.property))
+
+; SHORTHAND keys of the same literal. "return { symbol, interval, score }" is
+; the commonest spelling of all -- the reporting repo's own alert payload is
+; mostly shorthand -- and (pair) does not match it: tree-sitter models it as
+; shorthand_property_identifier, where the key IS the value. Found by dumping
+; the golden fixture and noticing that a literal returning
+; { level, message, timestamp: Date.now() } had indexed only timestamp.
+(return_statement
+  (object
+    (shorthand_property_identifier) @name @definition.property))
+
+; Shorthand keys of a named object literal -- same gap, same reason as the
+; return-position rule above.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (shorthand_property_identifier) @name @definition.property))
+
+; Same named shape, behind an IDENTITY-PRESERVING wrapper (R2-1a):
+;
+;   export const INERT_EXIT_CONTRACT = Object.freeze({ exitModel: 'bracket', ... });
+;
+; Freezing a config object is the idiomatic way to publish an immutable
+; contract, so the fields most worth querying are exactly the ones a bare
+; "value: (object)" pattern cannot see — one call expression sits between the
+; declarator and the literal.
+;
+; The allowlist is deliberately three functions rather than "any call". Only
+; these RETURN THE ARGUMENT THEY WERE GIVEN, which is what makes the literal's
+; keys members of the bound name. For an arbitrary "const x = compute({a: 1})"
+; the literal is an argument and x is compute's return value, so attributing
+; "a" to x would be a fabrication.
+(variable_declarator
+  name: (identifier)
+  value: (call_expression
+    function: (member_expression
+      object: (identifier) @_identity.obj
+      property: (property_identifier) @_identity.fn)
+    arguments: (arguments
+      (object
+        (pair
+          key: (property_identifier) @name) @definition.property)))
+  (#eq? @_identity.obj "Object")
+  (#match? @_identity.fn "^(freeze|seal|preventExtensions)$"))
+
+; Closure-valued class fields (#2693) — see the TypeScript block for why these
+; are Method rather than Property.
+(field_definition
+  property: (property_identifier) @name
+  value: (arrow_function)) @definition.method
+
+(field_definition
+  property: (property_identifier) @name
+  value: (function_expression)) @definition.method
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -434,11 +1065,18 @@ export const JAVASCRIPT_QUERIES = `
   right: (_)) @assignment
 
 ; HTTP consumers: fetch('/path'), axios.get('/path'), $.get('/path'), etc.
+; The URL alternation is OPTIONAL (#2897). Requiring a literal made the rule
+; blind to fetch(url) with a variable argument -- measured on this repo, 44 of
+; 47 fetch calls pass one, so 94% of outward calls produced no site at all. The
+; R3-6 sink set needs only WHERE the program reaches outward, not the URL; route
+; linking still needs the URL and already skips an entry without one
+; (normalizeFetchURL returns nothing and processNextjsFetchRoutes continues), so
+; widening here adds sink sites without inventing a single FETCHES edge.
 (call_expression
   function: (identifier) @_fetch_fn (#eq? @_fetch_fn "fetch")
   arguments: (arguments
     [(string (string_fragment) @route.url)
-     (template_string) @route.template_url])) @route.fetch
+     (template_string) @route.template_url]?)) @route.fetch
 
 ; Custom fetch wrappers: apiFetch('/path'), fetchJSON('/api/data'), httpGet('/users'), etc.
 (call_expression
@@ -505,11 +1143,16 @@ export const PYTHON_QUERIES = `
   (assignment
     left: (identifier) @name)) @definition.variable
 
-; Heritage queries - Python class inheritance
-(class_definition
-  name: (identifier) @heritage.class
-  superclasses: (argument_list
-    (identifier) @heritage.extends)) @heritage
+; Lambda bindings: \`f = lambda x: x\` binds a CALLABLE, so it emits Function
+; rather than Variable, matching what TS/JS already do for \`const f = () => {}\`.
+; This aligns the LABEL only — call resolution runs off the scope-resolution
+; query, which still models the binding as a value, so \`f()\` does not resolve
+; here yet. Overlap with the assignment pattern above is collapsed by the
+; parse-worker dedup (#2687).
+(expression_statement
+  (assignment
+    left: (identifier) @name
+    right: (lambda))) @definition.function
 
 ; Write access: obj.field = value
 (assignment
@@ -533,22 +1176,53 @@ export const PYTHON_QUERIES = `
     (string (string_content) @http_client.url))) @http_client
 
 ; Python decorators: @app.route, @router.get, etc.
+; The first positional argument is captured three ways (#2391): a string literal
+; path via @decorator.arg (quote-free, the fast path); a bare constant name or a
+; plus-concatenation via @decorator.arg_expr (resolved cross-file by the constant
+; resolver). The anchored optional alternation pins to the FIRST arg and stays
+; optional, so no-arg decorators (@app.tool(), etc.) and non-path first args still
+; match.
 (decorator
   (call
     function: (attribute
       object: (identifier) @decorator.receiver
       attribute: (identifier) @decorator.name)
     arguments: (argument_list
-      (string (string_content) @decorator.arg)?))) @decorator
+      .
+      [
+        (string (string_content)? @decorator.arg) @decorator.arg_str
+        (identifier) @decorator.arg_expr
+        (binary_operator) @decorator.arg_expr
+      ]?))) @decorator
 `;
 
 // Java queries - works with tree-sitter-java
 export const JAVA_QUERIES = `
-; Classes, Interfaces, Enums, Annotations
+; Classes, Interfaces, Enums, Records, Annotations
 (class_declaration name: (identifier) @name) @definition.class
 (interface_declaration name: (identifier) @name) @definition.interface
 (enum_declaration name: (identifier) @name) @definition.enum
+(record_declaration name: (identifier) @name) @definition.record
 (annotation_type_declaration name: (identifier) @name) @definition.annotation
+
+; Canonical record-component accessors are implicit public zero-argument methods.
+(record_declaration
+  parameters: (formal_parameters
+    (formal_parameter
+      name: (identifier) @name) @definition.method))
+(record_declaration
+  parameters: (formal_parameters
+    (spread_parameter
+      (variable_declarator
+        name: (identifier) @name)) @definition.method))
+
+; Anonymous class bodies: new Runnable() { ... } — no @name capture; the
+; class extractor synthesizes the javac-style Worker$N name (#2550)
+(object_creation_expression (class_body)) @definition.class
+
+; Enum constant bodies: enum E { A { ... } } — javac's other anonymous
+; shape, synthesized as E$N by the same naming authority (#2555)
+(enum_constant body: (class_body)) @definition.class
 
 ; Methods & Constructors
 (method_declaration name: (identifier) @name) @definition.method
@@ -575,20 +1249,33 @@ export const JAVA_QUERIES = `
   declarator: (variable_declarator
     name: (identifier) @name)) @definition.variable
 
-; Heritage - extends class
-(class_declaration name: (identifier) @heritage.class
-  (superclass (type_identifier) @heritage.extends)) @heritage
-
-; Heritage - implements interfaces
-(class_declaration name: (identifier) @heritage.class
-  (super_interfaces (type_list (type_identifier) @heritage.implements))) @heritage.impl
-
 ; Write access: obj.field = value
 (assignment_expression
   left: (field_access
     object: (_) @assignment.receiver
     field: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Closure bindings (#2693) ────────────────────────────────────────────────
+; A name bound to a closure literal IS a callable, so it emits Function rather
+; than a value label — matching TS/JS and the languages #2687 already covered.
+; The callable node is what callable-value-flow joins the binding to (by file,
+; line and name), which is what makes handler.apply(1) resolve. Overlap with the value
+; rules above is collapsed by the parse-worker dedup, which ranks callable
+; highest (#2687).
+; Anchored on field_declaration / local_variable_declaration — the SAME nodes
+; the value rules above use — so the parse-worker dedup (keyed by definition
+; node + name) actually collapses the pair. Anchoring on the inner
+; variable_declarator instead produced a Function AND a Property twin, the exact
+; double-indexing #2687 removed.
+(field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name
+    value: (lambda_expression))) @definition.function
+(local_variable_declaration
+  declarator: (variable_declarator
+    name: (identifier) @name
+    value: (lambda_expression))) @definition.function
 `;
 
 // C queries - works with tree-sitter-c
@@ -606,8 +1293,17 @@ export const C_QUERIES = `
 
 ; Structs, Unions, Enums, Typedefs
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
 (union_specifier name: (type_identifier) @name) @definition.union
 (enum_specifier name: (type_identifier) @name) @definition.enum
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 
 ; Macros
@@ -632,10 +1328,18 @@ export const GO_QUERIES = `
 ; Functions & Methods
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration name: (field_identifier) @name) @definition.method
+(method_elem name: (field_identifier) @name) @definition.method
 
 ; Types
-(type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
-(type_declaration (type_spec name: (type_identifier) @name type: (interface_type))) @definition.interface
+;
+; Anchored on the type_spec, NOT the enclosing type_declaration (#2837) — a
+; grouped type ( A struct{}; B struct{} ) block otherwise gave every match the
+; same capture node, and goClassConfig.extractName resolved all of them to the
+; FIRST spec's name, collapsing the block to one node. Must stay in lockstep
+; with @scope.class / @declaration.struct in languages/go/query.ts, which
+; carries the full rationale. (No backticks here: this is a template literal.)
+(type_declaration (type_spec name: (type_identifier) @name type: (struct_type)) @definition.struct)
+(type_declaration (type_spec name: (type_identifier) @name type: (interface_type)) @definition.interface)
 
 ; Imports
 (import_declaration (import_spec path: (interpreted_string_literal) @import.source)) @import
@@ -646,25 +1350,36 @@ export const GO_QUERIES = `
   (field_declaration
     name: (field_identifier) @name) @definition.property)
 
-; Struct embedding (anonymous fields = inheritance)
-(type_declaration
-  (type_spec
-    name: (type_identifier) @heritage.class
-    type: (struct_type
-      (field_declaration_list
-        (field_declaration
-          type: (type_identifier) @heritage.extends))))) @definition.struct
-
 ; Calls
 (call_expression function: (identifier) @call.name) @call
 (call_expression function: (selector_expression field: (field_identifier) @call.name)) @call
 
 ; Const/var declarations
-(const_declaration (const_spec name: (identifier) @name)) @definition.const
-(var_declaration (var_spec name: (identifier) @name)) @definition.variable
+(const_declaration (const_spec (identifier) @name)) @definition.const
+(var_declaration (var_spec (identifier) @name)) @definition.variable
+(var_declaration (var_spec_list (var_spec (identifier) @name))) @definition.variable
 
 ; Short variable declaration: x := 5
 (short_var_declaration left: (expression_list (identifier) @name)) @definition.variable
+
+; Closure bindings: \`var f = func(){}\` / \`f := func(){}\` bind a CALLABLE, so
+; they emit Function, not Variable — the same convention TS/JS already use for
+; \`const f = () => {}\`. This aligns the LABEL only — call resolution runs off
+; the scope-resolution query, which still models the binding as a value, so
+; \`f()\` does not resolve here yet. Overlap with the value patterns above is
+; collapsed by the parse-worker dedup (#2687).
+(var_declaration
+  (var_spec
+    name: (identifier) @name
+    value: (expression_list (func_literal)))) @definition.function
+(var_declaration
+  (var_spec_list
+    (var_spec
+      name: (identifier) @name
+      value: (expression_list (func_literal))))) @definition.function
+(short_var_declaration
+  left: (expression_list (identifier) @name)
+  right: (expression_list (func_literal))) @definition.function
 
 ; Struct literal construction: User{Name: "Alice"}
 (composite_literal type: (type_identifier) @call.name) @call
@@ -696,6 +1411,12 @@ export const CPP_QUERIES = `
   name: (template_type
     (type_identifier) @name
     (template_argument_list) @template-arguments)) @definition.class
+; Out-of-line nested definition: class Outer::Inner { ... } / struct Outer::Inner { ... }.
+; Key the node by the full qualified_identifier text so the def materializes a
+; node that matches the HAS_METHOD owner id (also the full qualified text) and
+; stays distinct from a same-tail type in another scope (#1975, #1978).
+(class_specifier name: (qualified_identifier) @name) @definition.class
+(struct_specifier name: (qualified_identifier) @name) @definition.struct
 (struct_specifier name: (type_identifier) @name) @definition.struct
 (struct_specifier
   name: (template_type
@@ -705,6 +1426,15 @@ export const CPP_QUERIES = `
 (enum_specifier name: (type_identifier) @name) @definition.enum
 
 ; Typedefs and unions (common in C-style headers and mixed C/C++ code)
+(type_definition
+  type: (struct_specifier
+    body: (field_declaration_list))
+  declarator: (type_identifier) @name) @definition.struct
+(type_definition
+  type: (enum_specifier
+    body: (enumerator_list))
+  declarator: (type_identifier) @name) @definition.enum
+(enumerator name: (identifier) @name) @definition.const
 (type_definition declarator: (type_identifier) @name) @definition.typedef
 (union_specifier name: (type_identifier) @name) @definition.union
 
@@ -814,11 +1544,28 @@ export const CPP_QUERIES = `
   declarator: (init_declarator
     declarator: (identifier) @name)) @definition.variable
 
-; Heritage
-(class_specifier name: (type_identifier) @heritage.class
-  (base_class_clause (type_identifier) @heritage.extends)) @heritage
-(class_specifier name: (type_identifier) @heritage.class
-  (base_class_clause (access_specifier) (type_identifier) @heritage.extends)) @heritage
+; Lambda bindings: \`auto f = [](int x){ … };\` binds a CALLABLE, so it emits
+; Function rather than Variable, matching TS/JS. This aligns the LABEL only —
+; call resolution runs off the scope-resolution query, which still models the
+; binding as a value, so \`f()\` does not resolve here yet. Overlap with the
+; pattern above is collapsed by the parse-worker dedup (#2687).
+(declaration
+  declarator: (init_declarator
+    declarator: (identifier) @name
+    value: (lambda_expression))) @definition.function
+
+; Structured bindings: auto [a, b] = makePair();  (one @name per bound identifier)
+(declaration
+  declarator: (init_declarator
+    declarator: (structured_binding_declarator
+      (identifier) @name))) @definition.variable
+
+; Structured bindings, reference form: auto& [x, y] = tup;
+(declaration
+  declarator: (init_declarator
+    declarator: (reference_declarator
+      (structured_binding_declarator
+        (identifier) @name)))) @definition.variable
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -882,26 +1629,23 @@ export const CSHARP_QUERIES = `
     (variable_declarator
       (identifier) @name))) @definition.variable
 
-; Heritage
-(class_declaration name: (identifier) @heritage.class
-  (base_list (identifier) @heritage.extends)) @heritage
-(class_declaration name: (identifier) @heritage.class
-  (base_list (generic_name (identifier) @heritage.extends))) @heritage
-
-; Interface inheritance: interface IFoo : IBar / interface IFoo : IBar, IBaz
-; Without these patterns, interface-to-interface relationships are never
-; captured, so transitive "class X implements IBar" chains are broken.
-(interface_declaration name: (identifier) @heritage.class
-  (base_list (identifier) @heritage.extends)) @heritage
-(interface_declaration name: (identifier) @heritage.class
-  (base_list (generic_name (identifier) @heritage.extends))) @heritage
-
 ; Write access: obj.field = value
 (assignment_expression
   left: (member_access_expression
     expression: (_) @assignment.receiver
     name: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Closure bindings (#2693) ────────────────────────────────────────────────
+; A name bound to a closure literal IS a callable, so it emits Function rather
+; than a value label — matching TS/JS and the languages #2687 already covered.
+; The callable node is what callable-value-flow joins the binding to (by file,
+; line and name), which is what makes handler(1) resolve. Overlap with the value
+; rules above is collapsed by the parse-worker dedup, which ranks callable
+; highest (#2687).
+(variable_declarator
+  (identifier) @name
+  (lambda_expression)) @definition.function
 `;
 
 // Rust queries - works with tree-sitter-rust
@@ -909,11 +1653,34 @@ export const RUST_QUERIES = `
 ; Functions & Items
 (function_item name: (identifier) @name) @definition.function
 (function_signature_item name: (identifier) @name) @definition.function
+
+; Closure bound to a let: let handler = || target(1);
+; Emits the Function NODE. Without it a Rust closure binding had no graph node
+; at all, so it could be neither a call target nor a call source (#2699), which
+; made Rust the one exception to "a closure bound to a name is a Function node
+; in every language" (#2687).
+; Anchor note: this channel puts @definition.function on the OUTER
+; let_declaration, which is the OPPOSITE of the scope-resolution channel in
+; languages/rust/query.ts (inner closure_expression, to align with
+; @scope.function). Both match their own channel's convention -- compare the
+; (lexical_declaration (variable_declarator ... (arrow_function))) rule above.
+(let_declaration
+  pattern: (identifier) @name
+  value: (closure_expression)) @definition.function
 (struct_item name: (type_identifier) @name) @definition.struct
+; A union is materialized as a Struct node (same rationale as the
+; scope-resolution @declaration.struct in languages/rust/query.ts: every
+; registry-primary resolution gate includes Struct but excludes Union, so a
+; Union-labeled node would be an unresolvable orphan). #1934 F71.
+(union_item name: (type_identifier) @name) @definition.struct
 (enum_item name: (type_identifier) @name) @definition.enum
 (trait_item name: (type_identifier) @name) @definition.trait
 (impl_item type: (type_identifier) @name !trait) @definition.impl
 (impl_item type: (generic_type type: (type_identifier) @name) !trait) @definition.impl
+; Scoped inherent impl: impl path::Type { ... }. Key the Impl node by the full
+; scoped_type_identifier text so it matches the owner id (also full text) and
+; stays distinct from a same-tail type in another module (#1975).
+(impl_item type: (scoped_type_identifier) @name !trait) @definition.impl
 (mod_item name: (identifier) @name) @definition.module
 
 ; Type aliases, const, static, macros
@@ -938,12 +1705,6 @@ export const RUST_QUERIES = `
 (field_declaration_list
   (field_declaration
     name: (field_identifier) @name) @definition.property)
-
-; Heritage (trait implementation) — all combinations of concrete/generic trait × concrete/generic type
-(impl_item trait: (type_identifier) @heritage.trait type: (type_identifier) @heritage.class) @heritage
-(impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (type_identifier) @heritage.class) @heritage
-(impl_item trait: (type_identifier) @heritage.trait type: (generic_type type: (type_identifier) @heritage.class)) @heritage
-(impl_item trait: (generic_type type: (type_identifier) @heritage.trait) type: (generic_type type: (type_identifier) @heritage.class)) @heritage
 
 ; Write access: obj.field = value
 (assignment_expression
@@ -1034,35 +1795,6 @@ export const PHP_QUERIES = `
   (const_element
     (name) @name)) @definition.const
 
-; ── Heritage: extends ────────────────────────────────────────────────────────
-(class_declaration
-  name: (name) @heritage.class
-  (base_clause
-    [(name) (qualified_name)] @heritage.extends)) @heritage
-
-; ── Heritage: implements ─────────────────────────────────────────────────────
-(class_declaration
-  name: (name) @heritage.class
-  (class_interface_clause
-    [(name) (qualified_name)] @heritage.implements)) @heritage.impl
-
-; ── Heritage: use trait (must capture enclosing class name) ──────────────────
-(class_declaration
-  name: (name) @heritage.class
-  body: (declaration_list
-    (use_declaration
-      [(name) (qualified_name)] @heritage.trait))) @heritage
-
-; ── Heritage: trait uses another trait (transitive trait composition) ────────
-; PHP allows a trait body to contain "use OtherTrait;". The trait-uses-trait
-; IMPLEMENTS edge is required by buildPhpMro to compute the full transitive
-; trait closure (depth 3+ chains).
-(trait_declaration
-  name: (name) @heritage.class
-  body: (declaration_list
-    (use_declaration
-      [(name) (qualified_name)] @heritage.trait))) @heritage
-
 ; PHP HTTP consumers: file_get_contents('/path'), curl_init('/path')
 (function_call_expression
   function: (name) @_php_http (#match? @_php_http "^(file_get_contents|curl_init)$")
@@ -1082,6 +1814,28 @@ export const PHP_QUERIES = `
     scope: (_) @assignment.receiver
     name: (variable_name (name) @assignment.property))
   right: (_)) @assignment
+
+; ── Closure bindings (#2693) ────────────────────────────────────────────────
+; A name bound to a closure literal IS a callable, so it emits Function rather
+; than a value label — matching TS/JS and the languages #2687 already covered.
+; The callable node is what callable-value-flow joins the binding to (by file,
+; line and name), which is what makes $handler(1) resolve. Overlap with the value
+; rules above is collapsed by the parse-worker dedup, which ranks callable
+; highest (#2687).
+; Captures the whole variable_name, so the node keeps PHP's \`$\` sigil. That is
+; not cosmetic: PHP holds variables and functions in SEPARATE namespaces, so
+; \`$save\` and \`save()\` can never collide in the language — but dropping the
+; sigil made both mint the id Function:<file>:save, and the local closure was
+; swallowed by the function's node (no node, therefore no edge). The property
+; rules in languages/php/query.ts already keep the sigil for the same reason.
+; The positional join normalises leading sigils, so the binding still matches
+; its own declaration.
+(assignment_expression
+  left: (variable_name) @name
+  right: (arrow_function)) @definition.function
+(assignment_expression
+  left: (variable_name) @name
+  right: (anonymous_function)) @definition.function
 `;
 
 // Ruby queries - works with tree-sitter-ruby
@@ -1096,9 +1850,20 @@ export const RUBY_QUERIES = `
 (module
   name: (constant) @name) @definition.module
 
+; Namespaced module: module Baz::Qux (name field is a scope_resolution node).
+; Separate top-level pattern (not a [...] alternation) so neither branch is
+; silently dropped — see #1975. The full scope_resolution text keys the node so
+; it matches the HAS_METHOD owner id derived from the same name field.
+(module
+  name: (scope_resolution) @name) @definition.module
+
 ; ── Classes ──────────────────────────────────────────────────────────────────
 (class
   name: (constant) @name) @definition.class
+
+; Namespaced class: class Foo::Bar (name field is a scope_resolution node).
+(class
+  name: (scope_resolution) @name) @definition.class
 
 ; ── Instance methods ─────────────────────────────────────────────────────────
 (method
@@ -1126,12 +1891,6 @@ export const RUBY_QUERIES = `
 (body_statement
   (identifier) @call.name @call)
 
-; ── Heritage: class < SuperClass ─────────────────────────────────────────────
-(class
-  name: (constant) @heritage.class
-  superclass: (superclass
-    (constant) @heritage.extends)) @heritage
-
 ; Write access: obj.field = value (Ruby setter — syntactically a method call to field=)
 (assignment
   left: (call
@@ -1145,6 +1904,49 @@ export const RUBY_QUERIES = `
     receiver: (_) @assignment.receiver
     method: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Closure bindings (#2693) ────────────────────────────────────────────────
+; A name bound to a closure literal IS a callable, so it emits Function rather
+; than a value label — matching TS/JS and the languages #2687 already covered.
+; The callable node is what callable-value-flow joins the binding to (by file,
+; line and name), which is what makes handler.call(1) resolve. Overlap with the value
+; rules above is collapsed by the parse-worker dedup, which ranks callable
+; highest (#2687).
+(assignment
+  left: (identifier) @name
+  right: (lambda)) @definition.function
+
+; The (lambda) rule above covers the stabby forms only. lambda do...end,
+; proc do...end and Proc.new are (call) nodes, so without these the scope
+; channel declared a closure the graph channel never gave a node to, and the
+; call fell through to the enclosing method. Same two-channel lockstep Rust
+; needed. Receiver constraints mirror ruby/query.ts exactly: bare for
+; lambda/proc, Proc-constant for new — otherwise every block-taking call
+; (items.map { }) would mint a Function node.
+(assignment
+  left: (identifier) @name
+  right: (call
+    !receiver
+    method: (identifier) @_lam
+    block: [(block) (do_block)])
+  (#eq? @_lam "lambda")) @definition.function
+
+(assignment
+  left: (identifier) @name
+  right: (call
+    !receiver
+    method: (identifier) @_prc
+    block: [(block) (do_block)])
+  (#eq? @_prc "proc")) @definition.function
+
+(assignment
+  left: (identifier) @name
+  right: (call
+    receiver: (constant) @_pc
+    method: (identifier) @_nw
+    block: [(block) (do_block)])
+  (#eq? @_pc "Proc")
+  (#eq? @_nw "new")) @definition.function
 `;
 
 // Kotlin queries - works with tree-sitter-kotlin (fwcd/tree-sitter-kotlin)
@@ -1176,10 +1978,56 @@ export const KOTLIN_QUERIES = `
 (function_declaration
   (simple_identifier) @name) @definition.function
 
+; ── Secondary constructors (F49 sibling F48, issue #1919) ────────────────
+; "constructor(...) { }" inside a class body is a secondary_constructor with
+; no name child — its only identity token is the anonymous "constructor"
+; keyword, captured here as @name so the node is named "constructor"
+; (matching kotlinMethodConfig.extractName). Multiple secondary constructors
+; share that name but get distinct ids via the worker's #<arity> suffix.
+(secondary_constructor
+  "constructor" @name) @definition.constructor
+
 ; ── Properties ───────────────────────────────────────────────────────────
 (property_declaration
   (variable_declaration
     (simple_identifier) @name)) @definition.property
+
+; Lambda bindings: \`val f = { x -> x }\` binds a CALLABLE, so it emits Function
+; rather than Property, matching TS/JS. This aligns the LABEL only — call
+; resolution runs off the scope-resolution query, which still models the binding
+; as a value, so \`f()\` does not resolve here yet. Overlap with the property
+; pattern above is collapsed by the parse-worker dedup (#2687).
+(property_declaration
+  (variable_declaration
+    (simple_identifier) @name)
+  (lambda_literal)) @definition.function
+
+; ── Destructuring declarations (F51, issue #1919) ────────────────────────
+; "val (a, b) = pair" binds several names through a multi_variable_declaration
+; (NOT a variable_declaration), which the property rule above misses. Emit one
+; @definition.property per bound name — the SAME label every other Kotlin val/var
+; gets (KOTLIN_QUERIES has no @definition.variable rule, so a single "val x"
+; is already a Property; matching that keeps destructured names consistent and
+; out of the block-scope local-symbol pruner that drops Variable/Const/Static).
+; The Kotlin "_" discard placeholder is filtered out here via (#not-eq? @name "_")
+; — these locals have no enclosing class, so the field-extractor enrichment path
+; never runs and cannot do the filtering itself. Each rule is a standalone
+; pattern (NOT a top-level [...] alternation), so the predicate is safe under
+; tree-sitter 0.21.1 (no sibling-branch drop). Loop destructuring
+; "for ((k, v) in m)" nests the SAME multi_variable_declaration directly under the
+; for_statement (no property_declaration wrapper); the scope-path loop binding only
+; handles the single variable_declaration form, so this rule does not double-emit.
+((property_declaration
+  (multi_variable_declaration
+    (variable_declaration
+      (simple_identifier) @name))) @definition.property
+  (#not-eq? @name "_"))
+
+((for_statement
+  (multi_variable_declaration
+    (variable_declaration
+      (simple_identifier) @name))) @definition.property
+  (#not-eq? @name "_"))
 
 ; Primary constructor val/var parameters (data class, value class, regular class)
 ; binding_pattern_kind contains "val" or "var" — without it, the param is not a property
@@ -1215,22 +2063,23 @@ export const KOTLIN_QUERIES = `
     (type_identifier) @call.name)) @call
 
 ; ── Infix function calls (e.g., a to b, x until y) ──────────────────────
+; tree-sitter-kotlin models infix_expression as three UNNAMED-FIELD children:
+; (operand) (operator) (operand) — all three are simple_identifier for
+; "a to b". The old rule "(infix_expression (simple_identifier) @call.name)"
+; matched EVERY simple_identifier child, so it captured the operands a/b as
+; spurious @call.name calls (F49, issue #1919). There is no operator: field to
+; anchor on, so anchor positionally: the operator is the middle child, flanked
+; by an operand on each side. End-anchored on both sides so only the lone
+; middle simple_identifier (the infix function) is captured; chained
+; "a to b to c" still matches each nested infix_expression's own operator.
 (infix_expression
-  (simple_identifier) @call.name) @call
-
-; ── Heritage: extends / implements via delegation_specifier ──────────────
-; Interface implementation (bare user_type): class Foo : Bar
-(class_declaration
-  (type_identifier) @heritage.class
-  (delegation_specifier
-    (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Class extension (constructor_invocation): class Foo : Bar()
-(class_declaration
-  (type_identifier) @heritage.class
-  (delegation_specifier
-    (constructor_invocation
-      (user_type (type_identifier) @heritage.extends)))) @heritage
+  .
+  (_)
+  .
+  (simple_identifier) @call.name
+  .
+  (_)
+  .) @call
 
 ; Write access: obj.field = value
 (assignment
@@ -1277,6 +2126,22 @@ export const SWIFT_QUERIES = `
 ; Properties (stored and computed)
 (property_declaration (pattern (simple_identifier) @name)) @definition.property
 
+; Closure bindings: \`let f = { ... }\` binds a CALLABLE, so it emits Function
+; rather than Property, matching TS/JS. This aligns the LABEL only — call
+; resolution runs off the scope-resolution query, which still models the binding
+; as a value, so \`f()\` does not resolve here yet. Overlap with the property
+; pattern above is collapsed by the parse-worker dedup (#2687).
+(property_declaration
+  name: (pattern (simple_identifier) @name)
+  value: (lambda_literal)) @definition.function
+
+; Protocol property requirements (F75): "var title: String { get }" parses to a
+; protocol_property_declaration (NOT property_declaration). Its name is a
+; "name:" pattern field wrapping a value_binding_pattern + the bound
+; simple_identifier; match the inner identifier so the requirement is emitted
+; as a property symbol of the protocol.
+(protocol_property_declaration (pattern (simple_identifier) @name)) @definition.property
+
 ; Enum cases
 (enum_entry (simple_identifier) @name) @definition.property
 
@@ -1288,19 +2153,6 @@ export const SWIFT_QUERIES = `
 
 ; Calls - member/navigation calls (obj.method())
 (call_expression (navigation_expression (navigation_suffix (simple_identifier) @call.name))) @call
-
-; Heritage - class/struct/enum inheritance and protocol conformance
-(class_declaration name: (type_identifier) @heritage.class
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Heritage - protocol inheritance
-(protocol_declaration name: (type_identifier) @heritage.class
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
-
-; Heritage - extension protocol conformance (e.g. extension Foo: SomeProtocol)
-; Extensions wrap the name in user_type unlike class/struct/enum declarations
-(class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
-  (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
 
 ; Write access: obj.field = value (tree-sitter-swift 0.7.1 uses named fields)
 (assignment
@@ -1336,11 +2188,35 @@ export const DART_QUERIES = `
 (enum_declaration
   name: (identifier) @name) @definition.enum
 
-; ── Type aliases ─────────────────────────────────────────────────────────────
-; Anchor "=" after the name to avoid capturing the RHS type
+; ── Type aliases — new-style (typedef Pred = bool Function(int);) ────────────
+; Anchor "=" after the name to avoid capturing the RHS type. The name is the
+; first type_identifier (the alias), the RHS function_type follows the "=".
 (type_alias
   (type_identifier) @name
   "=") @definition.type
+
+; ── Type aliases — old-style (typedef int Cmp(int a, int b);) ────────────────
+; The old-style function typedef has NO "=" — it parses as a type_alias whose
+; children are: return type_identifier, NAME type_identifier, formal_parameter_list.
+; Anchor @name as the type_identifier immediately before the parameter list so we
+; capture the alias name (Cmp), not the leading return type (int).
+(type_alias
+  (type_identifier) @name
+  .
+  (formal_parameter_list)) @definition.type
+
+; ── Type aliases — generic old-style (typedef int Cmp<T>(T a, T b);) ─────────
+; #1919 review CF2: a generic <T> inserts a type_parameters node between the
+; NAME and the parameter list, so the non-generic adjacency above misses it.
+; Standalone pattern (NOT an alternation arm) anchoring @name immediately before
+; type_parameters, which is immediately before the parameter list. The new-style
+; "=" rule above is unanchored and already covers generic new-style (Mapper<T>).
+(type_alias
+  (type_identifier) @name
+  .
+  (type_parameters)
+  .
+  (formal_parameter_list)) @definition.type
 
 ; ── Top-level functions (parent is program, not method_signature) ────────────
 (program
@@ -1380,6 +2256,19 @@ export const DART_QUERIES = `
     (initialized_identifier
       (identifier) @name))) @definition.property
 
+; ── static const / static final / const class fields ────────────────────────
+; A "static const a = 1;" / "static final String b = ..., c = ...;" field parses
+; with a static_final_declaration_list (NOT an initialized_identifier_list), so
+; the field rules above miss them. One @name per static_final_declaration, so a
+; multi-name declaration yields a Property per name. Anchored on declaration (not
+; class_body) so top-level final/const variables — whose
+; static_final_declaration_list is a direct child of program, not wrapped in a
+; declaration — never match here.
+(declaration
+  (static_final_declaration_list
+    (static_final_declaration
+      (identifier) @name))) @definition.property
+
 ; ── Getters ──────────────────────────────────────────────────────────────────
 (method_signature
   (getter_signature
@@ -1390,11 +2279,64 @@ export const DART_QUERIES = `
   (setter_signature
     name: (identifier) @name)) @definition.property
 
-; ── Top-level variable declarations (const maxSize = 100, final x = 5, var y = 0) ──
-(declaration
+; ── Top-level variable declarations ──────────────────────────────────────────
+; Top-level Dart variables are NOT wrapped in a declaration node (that wrapper
+; only occurs for class-body members). They sit as loose siblings under program:
+;   var name = 'x';   int x = 5;       → initialized_identifier_list
+;   final int count = 3;   const a = 1, b = 2;   → static_final_declaration_list
+; Anchor both rules under (program) so class-body fields (which reuse the same
+; inner node types) are never matched here. One @name per declared name so
+; multi-name forms (const a = 1, b = 2;) yield a Variable per name.
+(program
   (initialized_identifier_list
     (initialized_identifier
-      (identifier) @name))) @definition.variable
+      (identifier) @name)) @definition.variable)
+; Closure bindings: \`var f = (x) => x;\` binds a CALLABLE, so it emits Function
+; rather than Variable, matching TS/JS. Overlap with the pattern above is
+; collapsed by the parse-worker dedup (#2687). Since #2693 this node is also
+; what makes \`f()\` resolve: the scope-resolution query declares the binding as
+; a value, and callable-value-flow admits it as a call target precisely because
+; the node it resolves to is a Function.
+(program
+  (initialized_identifier_list
+    (initialized_identifier
+      (identifier) @name
+      (function_expression))) @definition.function)
+
+; ── Top-level final/const closure bindings (#2693) ──────────────────────────
+; \`final handler = (x) => x;\` parses as a static_final_declaration_list, not an
+; initialized_identifier_list, so the rules above never reach it — \`final\` is
+; the idiomatic top-level binding keyword and was the one closure form getting
+; neither the callable label nor resolution.
+(program
+  (static_final_declaration_list
+    (static_final_declaration
+      (identifier) @name
+      (function_expression))) @definition.function)
+
+; ── Function-local closure bindings (#2693) ─────────────────────────────────
+; \`void m() { var f = (x) => x; }\` — locals parse as initialized_variable_
+; definition, which the top-level rules above never reach, so a local closure
+; had no graph node at all and \`f()\` could not resolve. Restricted to a
+; function_expression value: ordinary locals stay unindexed, as before.
+(initialized_variable_definition
+  name: (identifier) @name
+  value: (function_expression)) @definition.function
+
+; Second and later declarators of a multi-name local (\`var f = .., g = ..;\`)
+; are initialized_identifier children NESTED INSIDE the same
+; initialized_variable_definition, which the \`name:\`/\`value:\` field rule above
+; only reaches for the FIRST name — so \`g\` silently had no node. Anchored on the
+; inner node so each name gets its own range; the top-level form lives under
+; initialized_identifier_list instead, so these never double-match.
+(initialized_variable_definition
+  (initialized_identifier
+    (identifier) @name
+    (function_expression)) @definition.function)
+(program
+  (static_final_declaration_list
+    (static_final_declaration
+      (identifier) @name)) @definition.variable)
 
 ; ── Imports ──────────────────────────────────────────────────────────────────
 (import_or_export
@@ -1503,25 +2445,6 @@ export const DART_QUERIES = `
     (unconditional_assignable_selector
       (identifier) @assignment.property))
   right: (_)) @assignment
-
-; ── Heritage: extends ────────────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  superclass: (superclass
-    (type_identifier) @heritage.extends)) @heritage
-
-; ── Heritage: implements ─────────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  interfaces: (interfaces
-    (type_identifier) @heritage.implements)) @heritage.impl
-
-; ── Heritage: with (mixins) ──────────────────────────────────────────────────
-(class_definition
-  name: (identifier) @heritage.class
-  superclass: (superclass
-    (mixins
-      (type_identifier) @heritage.trait))) @heritage
 `;
 
 import { SupportedLanguages } from 'gitnexus-shared';

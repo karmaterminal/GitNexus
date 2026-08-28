@@ -5,9 +5,7 @@
  * LanguageProvider, following the Strategy pattern used by the pipeline.
  *
  * Key Python traits:
- *   - importSemantics: 'namespace' (Python uses namespace imports, not wildcard)
  *   - mroStrategy: 'c3' (Python C3 linearization for multiple inheritance)
- *   - namedBindingExtractor: present (from X import Y)
  */
 
 import type { NodeLabel } from 'gitnexus-shared';
@@ -20,7 +18,6 @@ import { typeConfig as pythonConfig } from '../type-extractors/python.js';
 import { pythonExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
 import { pythonImportConfig } from '../import-resolvers/configs/python.js';
-import { extractPythonNamedBindings } from '../named-bindings/python.js';
 import { PYTHON_QUERIES } from '../tree-sitter-queries.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { pythonConfig as pythonFieldConfig } from '../field-extractors/configs/python.js';
@@ -30,7 +27,7 @@ import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { pythonVariableConfig } from '../variable-extractors/configs/python.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { pythonCallConfig } from '../call-extractors/configs/python.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import { createPythonCfgVisitor } from '../cfg/visitors/python.js';
 import type { CaptureMap } from '../language-provider.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import {
@@ -45,6 +42,9 @@ import {
   pythonReceiverBinding,
   resolvePythonImportTarget,
 } from './python/index.js';
+import { extractDjangoRoutes } from '../route-extractors/django.js';
+import { discoverDjangoRootUrls } from '../route-extractors/django-root-discovery.js';
+import { extractPythonModuleConstants } from '../route-extractors/python-const-resolver.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print',
@@ -126,17 +126,23 @@ export const pythonProvider = defineLanguage({
   typeConfig: pythonConfig,
   exportChecker: pythonExportChecker,
   importResolver: createImportResolver(pythonImportConfig),
-  namedBindingExtractor: extractPythonNamedBindings,
-  importSemantics: 'namespace',
   mroStrategy: 'c3',
   callExtractor: createCallExtractor(pythonCallConfig),
   fieldExtractor: createFieldExtractor(pythonFieldConfig),
   methodExtractor: createMethodExtractor(pythonMethodConfig),
   variableExtractor: createVariableExtractor(pythonVariableConfig),
   classExtractor: createClassExtractor(pythonClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.Python),
   descriptionExtractor: pythonDescriptionExtractor,
   builtInNames: BUILT_INS,
+  // Django routing is whole-repo and cross-file (manage.py → settings →
+  // ROOT_URLCONF → root urls.py, then include()s across files), so it runs as
+  // a main-thread pass (see parse-impl's cross-file route extraction) rather
+  // than the worker's single-file `isRouteFile` path. `reader` lets discovery
+  // and extraction resolve any repo-relative file regardless of parse chunking.
+  discoverRootRouteFiles: (files, contentMap, reader) =>
+    discoverDjangoRootUrls(files, contentMap, reader),
+  extractRoutes: (tree, filePath, reader, parser) =>
+    parser ? extractDjangoRoutes(tree, filePath, parser, reader) : [],
   labelOverride: pythonFunctionDefinitionLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
@@ -144,6 +150,7 @@ export const pythonProvider = defineLanguage({
   // full per-hook rationale and the canonical capture vocabulary in
   // ./python/query.ts (PYTHON_SCOPE_QUERY constant).
   emitScopeCaptures: emitPythonScopeCaptures,
+  cfgVisitor: createPythonCfgVisitor(),
   interpretImport: interpretPythonImport,
   interpretTypeBinding: interpretPythonTypeBinding,
   bindingScopeFor: pythonBindingScopeFor,
@@ -152,4 +159,17 @@ export const pythonProvider = defineLanguage({
   receiverBinding: pythonReceiverBinding,
   arityCompatibility: pythonArityCompatibility,
   resolveImportTarget: resolvePythonImportTarget,
+
+  // ── #2391 constant harvest, provider-hook form (#2980): module-level string
+  // constants + from-imports for non-literal decorator route paths. Bare-name
+  // refs fold through the shared resolver (no foldRoutePathOperands needed).
+  // No `moduleConstantHeuristic`: Python harvests unconditionally, exactly as
+  // #2391 shipped it. A content gate was tried here and removed on review — it
+  // required `NAME` immediately followed by `=`, so it silently dropped the two
+  // idiomatic typed-FastAPI shapes (`API: str = "/api"`,
+  // `API: Final[str] = "/api"`) and every composed constant whose RHS starts
+  // with an identifier (`USERS = BASE + "/users"`), i.e. it REGRESSED routes
+  // that already resolve on main. The worker treats a missing heuristic as
+  // default-open; only Java opts into a gate, where the cost actually bites.
+  extractModuleConstants: extractPythonModuleConstants,
 });

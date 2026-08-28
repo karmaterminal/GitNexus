@@ -1,5 +1,12 @@
 import type { ParsedFile } from 'gitnexus-shared';
+import { logger } from '../../../logger.js';
 import { isClassLike, populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
+
+import { goPackageDir, inferGoPackageName } from './package-clause.js';
+import { stampGoInterfaceTypeParameters } from './generic-type-parameters.js';
+
+/** Bound on the sample of no-package-clause paths named in the warning. */
+const SKIPPED_SAMPLE_CAP = 5;
 
 /**
  * Populate `ownerId` on Go Method defs by matching receiver types
@@ -26,14 +33,41 @@ export function populateGoWorkspaceOwners(
   parsedFiles: readonly ParsedFile[],
   ctx: { readonly fileContents: ReadonlyMap<string, string> },
 ): void {
+  // Generic interfaces get their type-parameter list stamped here rather than at
+  // capture time, because this is the first main-thread hook that sees BOTH the
+  // parsed scopes and the file text (it already reads `fileContents` for the
+  // package clause). `detectGoInterfaceImplementations` runs later in the same
+  // pass and is the only reader. See `stampGoInterfaceTypeParameters`.
+  stampGoInterfaceTypeParameters(parsedFiles, ctx.fileContents);
+
   const filesByPackage = new Map<string, ParsedFile[]>();
+  // A file with no resolvable package clause is dropped from ownership
+  // resolution entirely — its methods never attach to a struct declared in a
+  // sibling file. That used to be a bare `continue` with no trace, which is the
+  // same false-safe silence #2813 was filed about. Report it once, bounded
+  // (mirrors the fan-out-cap warning in scope-resolution/pipeline/run.ts).
+  let skippedCount = 0;
+  const skippedSample: string[] = [];
   for (const parsed of parsedFiles) {
-    const pkgName = inferPackageName(ctx.fileContents.get(parsed.filePath) ?? '');
-    if (pkgName === null) continue;
-    const key = `${packageDir(parsed.filePath)}\0${pkgName}`;
+    const pkgName = inferGoPackageName(ctx.fileContents.get(parsed.filePath) ?? '');
+    if (pkgName === null) {
+      // Count everything, retain only the sample — a misrouted vendored tree
+      // would otherwise accumulate one path reference per file to print five.
+      skippedCount += 1;
+      if (skippedSample.length < SKIPPED_SAMPLE_CAP) skippedSample.push(parsed.filePath);
+      continue;
+    }
+    const key = `${goPackageDir(parsed.filePath)}\0${pkgName}`;
     const bucket = filesByPackage.get(key) ?? [];
     bucket.push(parsed);
     filesByPackage.set(key, bucket);
+  }
+  if (skippedCount > 0) {
+    logger.warn(
+      { skippedFiles: skippedCount, sample: skippedSample },
+      'go: files with no resolvable package clause were excluded from method-owner ' +
+        'resolution (their methods cannot attach to structs declared in sibling files)',
+    );
   }
 
   for (const bucket of filesByPackage.values()) {
@@ -44,12 +78,15 @@ export function populateGoWorkspaceOwners(
 function populateGoOwnersInPackage(parsedFiles: readonly ParsedFile[]): void {
   // Build struct name → def map from ALL scopes' ownedDefs (struct defs
   // live in Class scopes now, not Module scope).
-  const structByQualifiedName = new Map<string, string>(); // qname → nodeId
+  const structByQualifiedName = new Map<string, { nodeId: string; qualifiedName: string }>();
   for (const parsed of parsedFiles) {
     for (const scope of parsed.scopes) {
       for (const def of scope.ownedDefs) {
         if (isClassLike(def.type) && def.qualifiedName) {
-          structByQualifiedName.set(def.qualifiedName, def.nodeId);
+          structByQualifiedName.set(def.qualifiedName, {
+            nodeId: def.nodeId,
+            qualifiedName: def.qualifiedName,
+          });
         }
       }
     }
@@ -69,40 +106,38 @@ function populateGoOwnersInPackage(parsedFiles: readonly ParsedFile[]): void {
 
         // Find the self typeBinding in this Function scope.
         let receiverType: string | undefined;
+        let receiverKind: 'value' | 'pointer' = 'value';
         for (const [, tb] of scope.typeBindings) {
           if (tb.source === 'self') {
             receiverType = tb.rawName;
+            receiverKind = tb.rawName.trim().startsWith('*') ? 'pointer' : 'value';
             break;
           }
         }
         if (receiverType === undefined) continue;
+        receiverType = receiverType.replace(/^\*+/, '').trim();
 
-        let ownerId = structByQualifiedName.get(receiverType);
-        if (ownerId === undefined) {
-          for (const [qname, nodeId] of structByQualifiedName) {
+        let owner = structByQualifiedName.get(receiverType);
+        if (owner === undefined) {
+          for (const [qname, candidate] of structByQualifiedName) {
             if (qname.endsWith('.' + receiverType)) {
-              ownerId = nodeId;
+              owner = candidate;
               break;
             }
           }
         }
-        if (ownerId !== undefined) {
+        if (owner !== undefined) {
           for (const def of methodDefs) {
-            (def as { ownerId?: string }).ownerId = ownerId;
+            (def as { ownerId?: string }).ownerId = owner.nodeId;
+            (def as { goReceiverKind?: 'value' | 'pointer' }).goReceiverKind = receiverKind;
+            const simpleName = def.qualifiedName?.split('.').pop() ?? def.qualifiedName;
+            if (simpleName !== undefined && !def.qualifiedName?.includes('.')) {
+              (def as { qualifiedName?: string }).qualifiedName =
+                `${owner.qualifiedName}.${simpleName}`;
+            }
           }
         }
       }
     }
   }
-}
-
-function inferPackageName(sourceText: string): string | null {
-  const match = sourceText.match(/^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)/m);
-  return match?.[1] ?? null;
-}
-
-function packageDir(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const idx = normalized.lastIndexOf('/');
-  return idx === -1 ? '' : normalized.slice(0, idx);
 }
