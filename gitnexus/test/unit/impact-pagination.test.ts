@@ -46,30 +46,52 @@ function makeBackend() {
   return { backend, repoHandle };
 }
 
+// The BFS frontier query is now parameterized (bound $frontierIds/$relTypes,
+// #1907 U3), so the caller rows come back through executeParameterizedMock
+// (matched on `r.type IN`) rather than executeQueryMock. Symbol resolution and
+// the label-enrichment UNION still fall through to the default symbol row.
 function setupMultiDepthHub(d1Count: number, d2Count: number) {
   let depth = 0;
   executeParameterizedMock.mockImplementation(async (...args: any[]) => {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
+    // The #1858 epistemic-boundary probe (computeEpistemicBoundary) runs
+    // concurrently with the BFS and also matches `r.type IN`, but targets the
+    // `iface` alias. Return empty so it stays `epistemic: 'exact'` and does not
+    // consume a depth slot from the frontier counter below.
+    if (query.includes('iface')) return [];
+    if (query.includes('r.type IN')) {
+      depth++;
+      const count = depth === 1 ? d1Count : depth === 2 ? d2Count : 0;
+      const res: any[] = [];
+      for (let i = 0; i < count; i++) {
+        res.push({
+          id: `d${depth}-caller-${i}`,
+          name: `d${depth}caller${i}`,
+          filePath: `src/d${depth}-caller-${i}.ts`,
+          relType: 'CALLS',
+          confidence: null,
+        });
+      }
+      return res;
+    }
     return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
   });
 
-  executeQueryMock.mockImplementation(async () => {
-    depth++;
-    const count = depth === 1 ? d1Count : depth === 2 ? d2Count : 0;
-    const res: any[] = [];
-    for (let i = 0; i < count; i++) {
-      res.push({
-        id: `d${depth}-caller-${i}`,
-        name: `d${depth}caller${i}`,
-        filePath: `src/d${depth}-caller-${i}.ts`,
-        relType: 'CALLS',
-        confidence: null,
-      });
-    }
-    return res;
-  });
+  executeQueryMock.mockImplementation(async () => []);
+}
+
+// `impacted` is ordered by node id, and ids are STRINGS — so `caller-107` sorts
+// before `caller-11`, not after. That was always production's order (the frontier
+// query used to carry `ORDER BY id`), but the mock returns rows unsorted and the
+// old code trusted the DB, so these expectations used to encode the mock's numeric
+// insertion order — an order the real engine never produced. #2787 moved the sort
+// into JS, which is what finally makes the mocked path agree with production.
+/** The nth caller in id (code-unit) order, matching what `_impactImpl` returns. */
+function callerAtIndex(total: number, index: number): string {
+  const sorted = Array.from({ length: total }, (_, i) => `caller-${i}`).sort();
+  return sorted[index].replace('caller-', 'caller');
 }
 
 function setupHubSymbol(count: number) {
@@ -77,12 +99,10 @@ function setupHubSymbol(count: number) {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
-    return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
-  });
-
-  executeQueryMock.mockImplementation(async (...args: any[]) => {
-    const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
-    if (query.includes('r.type IN') && !query.includes('STEP_IN_PROCESS')) {
+    // See setupMultiDepthHub — keep the #1858 epistemic probe from matching the
+    // `r.type IN` caller branch below.
+    if (query.includes('iface')) return [];
+    if (query.includes('r.type IN')) {
       const res: any[] = [];
       for (let i = 0; i < count; i++) {
         res.push({
@@ -95,8 +115,10 @@ function setupHubSymbol(count: number) {
       }
       return res;
     }
-    return [];
+    return [{ id: 'hub1', name: 'HubSymbol', filePath: 'hub.ts' }];
   });
+
+  executeQueryMock.mockImplementation(async () => []);
 }
 
 describe('impact: pagination and summaryOnly (#414)', () => {
@@ -154,7 +176,7 @@ describe('impact: pagination and summaryOnly (#414)', () => {
     });
 
     expect(res.byDepth[1].length).toBe(20);
-    expect(res.byDepth[1][0].name).toBe('caller10');
+    expect(res.byDepth[1][0].name).toBe(callerAtIndex(200, 10));
     expect(res.pagination).toEqual({
       limit: 20,
       offset: 10,
@@ -233,6 +255,34 @@ describe('impact: pagination and summaryOnly (#414)', () => {
     expect(res.byDepthCounts).toEqual({ 1: 800 });
     expect(res.byDepth).toBeUndefined();
     expect(res.pagination).toBeUndefined();
+  });
+
+  it.each([
+    ['skipEpistemic', { skipEpistemic: true }],
+    ['summaryOnly', { summaryOnly: true }],
+  ])('%s suppresses Class bean metadata lookups', async (_name, suppression) => {
+    const { backend, repoHandle } = makeBackend();
+    setupHubSymbol(1);
+
+    await (backend as any)._runImpactBFS(
+      repoHandle,
+      { id: 'hub1', name: 'HubClass' },
+      'Class',
+      'upstream',
+      {
+        maxDepth: 1,
+        relationTypes: ['CALLS'],
+        includeTests: false,
+        minConfidence: 0,
+        ...suppression,
+      },
+    );
+
+    expect(
+      executeParameterizedMock.mock.calls.some((args) =>
+        String(args[1] ?? '').includes('frameworkAnnotations'),
+      ),
+    ).toBe(false);
   });
 
   it('limit clamps to 1–10000 range', async () => {
@@ -324,7 +374,7 @@ describe('impact: pagination and summaryOnly (#414)', () => {
     });
 
     expect(res.byDepth[1].length).toBe(20);
-    expect(res.byDepth[1][0].name).toBe('caller5');
+    expect(res.byDepth[1][0].name).toBe(callerAtIndex(50, 5));
     expect(res.pagination.limit).toBe(20);
     expect(res.pagination.offset).toBe(5);
   });

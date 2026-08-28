@@ -4,12 +4,9 @@ import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
+import { mapConcurrent } from '../../lib/utils.js';
 
 import { logger } from '../logger.js';
-export interface FileEntry {
-  path: string;
-  content: string;
-}
 
 /** Lightweight entry — path + size from stat, no content in memory */
 export interface ScannedFile {
@@ -24,6 +21,27 @@ export interface FilePath {
 
 const READ_CONCURRENCY = 32;
 const ANALYZE_PROGRESS_ACTIVE_ENV = 'GITNEXUS_ANALYZE_PROGRESS_ACTIVE';
+
+const DECLARATION_COMPANION_SUFFIXES = [
+  { declaration: '.d.ts', implementations: ['.ts', '.tsx'] },
+  { declaration: '.d.mts', implementations: ['.mts'] },
+  { declaration: '.d.cts', implementations: ['.cts'] },
+] as const;
+
+const hasImplementationSibling = (
+  declarationPath: string,
+  scannedPaths: ReadonlySet<string>,
+): boolean => {
+  const companion = DECLARATION_COMPANION_SUFFIXES.find(({ declaration }) =>
+    declarationPath.endsWith(declaration),
+  );
+  if (!companion) return false;
+
+  // Keep standalone declarations. Only suppress declaration output that sits
+  // beside an implementation with the corresponding module suffix.
+  const stem = declarationPath.slice(0, -companion.declaration.length);
+  return companion.implementations.some((suffix) => scannedPaths.has(`${stem}${suffix}`));
+};
 
 const warnLargeFileSkip = (message: string): void => {
   if (process.env[ANALYZE_PROGRESS_ACTIVE_ENV] === '1') {
@@ -87,6 +105,18 @@ export const walkRepositoryPaths = async (
     }
   }
 
+  const scannedPaths = new Set(entries.map((entry) => entry.path));
+  const deduplicatedEntries = entries.filter(
+    (entry) => !hasImplementationSibling(entry.path, scannedPaths),
+  );
+
+  // Filesystem/glob traversal order is not stable across filesystems or repeated
+  // scans. Canonicalize once at the scan boundary so every downstream phase sees
+  // the same repository order.
+  deduplicatedEntries.sort((left, right) =>
+    left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+  );
+
   if (skippedLarge > 0) {
     const isDefault = maxFileSizeBytes === DEFAULT_MAX_FILE_SIZE_BYTES;
     const isOverrideUnset = !process.env.GITNEXUS_MAX_FILE_SIZE;
@@ -121,7 +151,7 @@ export const walkRepositoryPaths = async (
     }
   }
 
-  return entries;
+  return deduplicatedEntries;
 };
 
 /**
@@ -134,40 +164,22 @@ export const readFileContents = async (
 ): Promise<Map<string, string>> => {
   const contents = new Map<string, string>();
 
-  for (let start = 0; start < relativePaths.length; start += READ_CONCURRENCY) {
-    const batch = relativePaths.slice(start, start + READ_CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map(async (relativePath) => {
-        const fullPath = path.join(repoPath, relativePath);
-        const content = await fs.readFile(fullPath, 'utf-8');
-        return { path: relativePath, content };
-      }),
-    );
+  const results = await mapConcurrent(
+    relativePaths,
+    async (relativePath) => {
+      const fullPath = path.join(repoPath, relativePath);
+      const content = await fs.readFile(fullPath, 'utf-8');
+      return { path: relativePath, content };
+    },
+    { concurrency: READ_CONCURRENCY },
+  );
 
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        contents.set(result.value.path, result.value.content);
-      }
-    }
+  // An unreadable file yields `undefined` (mapConcurrent's per-item degrade) and
+  // is skipped, exactly as the previous allSettled/`status === 'fulfilled'` shape
+  // did — no `onError`, so the skip stays silent per this function's contract.
+  for (const result of results) {
+    if (result) contents.set(result.path, result.content);
   }
 
   return contents;
-};
-
-/**
- * Legacy API — scans and reads everything into memory.
- * Used by sequential fallback path only.
- */
-export const walkRepository = async (
-  repoPath: string,
-  onProgress?: (current: number, total: number, filePath: string) => void,
-): Promise<FileEntry[]> => {
-  const scanned = await walkRepositoryPaths(repoPath, onProgress);
-  const contents = await readFileContents(
-    repoPath,
-    scanned.map((f) => f.path),
-  );
-  return scanned
-    .filter((f) => contents.has(f.path))
-    .map((f) => ({ path: f.path, content: contents.get(f.path)! }));
 };

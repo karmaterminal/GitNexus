@@ -142,10 +142,30 @@ describe('emitTsScopeCaptures — declarations', () => {
     expect(m!['@declaration.name'].text).toBe('Status');
   });
 
-  it('captures type-alias declarations under @declaration.type', () => {
-    const m = findMatch('type ID = string;', (t) => t.includes('@declaration.type'));
+  // The tag is `@declaration.type_alias`, matching Kotlin and Dart. It was
+  // `@declaration.type`, which `normalizeNodeLabel` does not recognize — it
+  // accepts `typealias` / `type_alias` and has no `type` case — so the capture
+  // fired but mapped to NO label and TypeScript aliases produced no
+  // scope-resolution def at all. This test passed the whole time because it
+  // asserted only that the capture existed, never that it resolved to
+  // anything; the label assertion below is what stops a dead tag being pinned
+  // again.
+  it('captures type-alias declarations under @declaration.type_alias', () => {
+    const m = findMatch('type ID = string;', (t) => t.includes('@declaration.type_alias'));
     expect(m).toBeDefined();
     expect(m!['@declaration.name'].text).toBe('ID');
+  });
+
+  it('maps the type-alias capture to a real NodeLabel', () => {
+    const m = findMatch('type ID = string;', (t) => t.includes('@declaration.type_alias'));
+    const anchor = Object.keys(m!).find(
+      (k) => k.startsWith('@declaration.') && k !== '@declaration.name',
+    );
+    expect(anchor).toBeDefined();
+    // The kind string the extractor derives from the anchor must be one
+    // `normalizeNodeLabel` accepts, or the declaration silently vanishes.
+    const kind = anchor!.slice('@declaration.'.length);
+    expect(['typealias', 'type_alias']).toContain(kind);
   });
 
   it('captures namespace declarations under @declaration.namespace', () => {
@@ -563,5 +583,167 @@ describe('emitTsScopeCaptures — edge cases', () => {
 
   it('handles empty input gracefully', () => {
     expect(() => emitTsScopeCaptures('', 'test.ts')).not.toThrow();
+  });
+});
+
+describe('emitTsScopeCaptures — #1876 array-method-callback narrowing', () => {
+  // True when some match carries `tag` and its @declaration.name is `name`.
+  const declWithName = (src: string, tag: string, name: string): boolean =>
+    emitTsScopeCaptures(src, 'test.ts').some(
+      (m) => m[tag] !== undefined && m['@declaration.name']?.text === name,
+    );
+  const countTag = (src: string, tag: string): number =>
+    emitTsScopeCaptures(src, 'test.ts').filter((m) => m[tag] !== undefined).length;
+
+  it('does not emit @declaration.function for `const x = arr.map(a => …)`', () => {
+    const src = 'const exportData = accountsList.map((account) => ({ id: account.id }));';
+    expect(declWithName(src, '@declaration.variable', 'exportData')).toBe(true);
+    expect(declWithName(src, '@declaration.function', 'exportData')).toBe(false);
+  });
+
+  // Every method in ARRAY_CALLBACK_METHODS except `map` (covered above).
+  it.each([
+    'filter',
+    'find',
+    'findIndex',
+    'findLast',
+    'findLastIndex',
+    'reduce',
+    'reduceRight',
+    'forEach',
+    'some',
+    'every',
+    'flatMap',
+    'sort',
+  ])('suppresses the Function def for array method .%s()', (method) => {
+    const src = `const x = arr.${method}((a) => a);`;
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+    expect(declWithName(src, '@declaration.variable', 'x')).toBe(true);
+  });
+
+  it('keeps @declaration.function for an identifier-callee HOC (forwardRef)', () => {
+    const src = 'const Button = forwardRef((props, ref) => null);';
+    expect(declWithName(src, '@declaration.function', 'Button')).toBe(true);
+  });
+
+  it('keeps @declaration.function for useCallback (identifier callee, unchanged this round)', () => {
+    const src = 'const cb = useCallback(() => doThing(), []);';
+    expect(declWithName(src, '@declaration.function', 'cb')).toBe(true);
+  });
+
+  it('keeps dual classification for a direct arrow `const fn = () => {}`', () => {
+    const src = 'const fn = () => { doThing(); };';
+    expect(declWithName(src, '@declaration.function', 'fn')).toBe(true);
+    expect(declWithName(src, '@declaration.variable', 'fn')).toBe(true);
+  });
+
+  it('keeps @declaration.function for a non-array fluent-API member call (accepted limitation)', () => {
+    const src = 'const q = qb.where((row) => row.ok);';
+    expect(declWithName(src, '@declaration.function', 'q')).toBe(true);
+  });
+
+  it('suppresses an in-set method name on a NON-array receiver (accepted receiver-blind limitation)', () => {
+    // Receiver-blind by design — see array-callback.ts. An in-set method name
+    // on a non-array receiver (RxJS observable, Map/Set, query builder) also
+    // loses its Function def. Accepted: the binding holds a value, not a callable.
+    const src = 'const stream = source$.map((event) => handle(event));';
+    expect(declWithName(src, '@declaration.function', 'stream')).toBe(false);
+    expect(declWithName(src, '@declaration.variable', 'stream')).toBe(true);
+  });
+
+  it('suppresses the outer .map() callback in a chained array call', () => {
+    const src = 'const x = arr.filter((a) => a).map((b) => b);';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+    expect(declWithName(src, '@declaration.variable', 'x')).toBe(true);
+  });
+
+  it('suppresses through an export_statement wrapper', () => {
+    const src = 'export const x = arr.map((a) => a);';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+    expect(declWithName(src, '@declaration.variable', 'x')).toBe(true);
+  });
+
+  it('suppresses a function_expression callback', () => {
+    const src = 'const x = arr.map(function (a) { return a; });';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+    expect(declWithName(src, '@declaration.variable', 'x')).toBe(true);
+  });
+
+  it('suppresses an optional-chained array call `arr?.map(...)`', () => {
+    const src = 'const x = arr?.map((a) => a);';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+  });
+
+  it('suppresses a parenthesized callee `(arr.map)(cb)`', () => {
+    const src = 'const x = (arr.map)((a) => a);';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+  });
+
+  it('suppresses a computed callee `arr["map"](cb)`', () => {
+    const src = 'const x = arr["map"]((a) => a);';
+    expect(declWithName(src, '@declaration.function', 'x')).toBe(false);
+  });
+
+  it('suppresses export-default array-method wrappers', () => {
+    const src = 'export default arr.map((a) => a);';
+    expect(countTag(src, '@declaration.function')).toBe(0);
+  });
+
+  it('suppresses obvious built-in callback wrappers in export default', () => {
+    const src = 'export default setTimeout(() => work());';
+    expect(countTag(src, '@declaration.function')).toBe(0);
+  });
+
+  it('rewrites export-default HOC names to the file stem', () => {
+    const matches = emitTsScopeCaptures(
+      'export default React.memo((props) => props);',
+      'routes/health-check.tsx',
+    );
+    expect(
+      matches.some(
+        (m) =>
+          m['@declaration.function'] !== undefined &&
+          m['@declaration.name']?.text === 'health-check',
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('emitTsScopeCaptures — value-position references (#2437)', () => {
+  it('captures a longhand pair value identifier as @reference.value-ref with its key', () => {
+    const match = findMatch(
+      'function emitHook(): void {}\nexport const provider = { emitScopeCaptures: emitHook };',
+      (t) => t.includes('@reference.value-ref'),
+    );
+    expect(match).toBeDefined();
+    expect(match!['@reference.name'].text).toBe('emitHook');
+    expect(match!['@reference.property-key'].text).toBe('emitScopeCaptures');
+  });
+
+  it('captures a shorthand property as @reference.value-ref with key = name', () => {
+    const match = findMatch(
+      'function emitHook(): void {}\nexport const provider = { emitHook };',
+      (t) => t.includes('@reference.value-ref'),
+    );
+    expect(match).toBeDefined();
+    expect(match!['@reference.name'].text).toBe('emitHook');
+    expect(match!['@reference.property-key'].text).toBe('emitHook');
+  });
+
+  it('does not fire on destructuring shorthand', () => {
+    expect(
+      countMatches('const o = { a: 1 };\nconst { a } = o;', (t) =>
+        t.includes('@reference.value-ref'),
+      ),
+    ).toBe(0);
+  });
+
+  it('does not fire on a pair whose value is a call expression', () => {
+    expect(
+      countMatches(
+        'function make(): number { return 1; }\nexport const provider = { cfgVisitor: make() };',
+        (t) => t.includes('@reference.value-ref'),
+      ),
+    ).toBe(0);
   });
 });

@@ -8,7 +8,8 @@
  */
 
 import { resolveRubyImportInternal } from '../../import-resolvers/ruby.js';
-import { buildSuffixIndex } from '../../import-resolvers/utils.js';
+import { getWorkspaceFileIndex } from '../../import-resolvers/workspace-file-index.js';
+import { isHeritageMarker } from '../../utils/heritage-marker.js';
 
 export interface RubyResolveContext {
   readonly fromFile: string;
@@ -37,7 +38,7 @@ export function resolveRubyImportTarget(
   _resolutionConfig?: unknown,
 ): string | readonly string[] | null {
   if (!targetRaw) return null;
-  if (targetRaw.startsWith('__heritage__:') || targetRaw.startsWith('__property__:')) return null;
+  if (isHeritageMarker(targetRaw)) return null;
 
   const fromNormalized = fromFile.replace(/\\/g, '/');
   const fromDir = fromNormalized.includes('/')
@@ -99,9 +100,10 @@ function resolveRelative(
  * via suffix matching using the existing Ruby import resolver.
  */
 function resolveBare(targetRaw: string, allFilePaths: ReadonlySet<string>): string | null {
-  const normalizedFileList = [...allFilePaths].map((f) => f.replace(/\\/g, '/'));
-  const allFileList = [...allFilePaths];
-  const index = buildSuffixIndex(normalizedFileList, allFileList);
-
-  return resolveRubyImportInternal(targetRaw, normalizedFileList, allFileList, index);
+  // Was: two array materializations plus a full `buildSuffixIndex` per require,
+  // thrown away on return — every require paid to index every file in the repo
+  // (#2880). `buildSuffixIndex` is a pure function of the file set, so this is a
+  // hoist, not a behaviour change.
+  const { normalized, all, index } = getWorkspaceFileIndex(allFilePaths);
+  return resolveRubyImportInternal(targetRaw, normalized, all, index);
 }

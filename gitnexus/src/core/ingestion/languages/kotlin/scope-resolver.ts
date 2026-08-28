@@ -5,6 +5,7 @@ import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolv
 import { resolveDefGraphId } from '../../scope-resolution/graph-bridge/ids.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import { isClassLike } from '../../scope-resolution/scope/walkers.js';
+import { indexOnlyElementType } from '../../type-extractors/shared.js';
 import { kotlinProvider } from '../kotlin.js';
 import {
   kotlinArityCompatibility,
@@ -14,19 +15,28 @@ import {
   type KotlinResolveContext,
 } from './index.js';
 import { clearCompanionScopes } from './companion-scopes.js';
+import {
+  applyKotlinCaptureSideChannel,
+  clearKotlinClassAnnotationFacts,
+} from './capture-side-channel.js';
 import { isKotlinStaticOnly } from './owners.js';
+import { populateKotlinPackageSiblings } from './package-siblings.js';
+import { attachKotlinSpringBeanCandidateMetadata } from './spring-bean-metadata.js';
+import { attachKotlinSpringAopMetadata } from './spring-aop.js';
+import { clearKotlinPackageFacts } from './package-facts.js';
+import { attachKotlinSpringDiMetadata } from './spring-di.js';
+import { attachKotlinSpringConditionalMetadata } from './spring-conditionals.js';
+import { attachKotlinSpringNonHttpHandlerMetadata } from './spring-non-http-handlers.js';
 
 /**
  * Kotlin scope resolver for RFC #909 Ring 3.
  *
- * **Migration status:** Kotlin is in `MIGRATED_LANGUAGES`. Default
- * production resolution flows through the scope-resolution pipeline;
- * the legacy DAG is consulted only when the per-language env var
- * (`REGISTRY_PRIMARY_KOTLIN=0`) explicitly forces the legacy parity
- * run for CI comparison.
+ * Kotlin resolves via the scope-resolution registry — production
+ * resolution flows through the scope-resolution pipeline as the sole
+ * call-resolution path.
  *
- * **Forced-mode parity (`REGISTRY_PRIMARY_KOTLIN=1`):** 208/208
- * fixtures pass after the migration sub-issues #1758–#1763, the
+ * **Coverage:** 208/208 fixtures pass after the migration sub-issues
+ * #1758–#1763, the
  * companion/instance dispatch fix #1756, and the lambda scopes
  * fix #1757. Covers core import, receiver, companion, default-param,
  * vararg, constructor, local assignment-chain, collection-iteration,
@@ -69,11 +79,17 @@ export const kotlinScopeResolver: ScopeResolver = {
     // `undefined` because Kotlin has no external resolution config
     // to load.
     clearCompanionScopes();
+    clearKotlinClassAnnotationFacts();
+    clearKotlinPackageFacts();
     return undefined;
   },
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths) => {
-    const ws: KotlinResolveContext = { fromFile, allFilePaths };
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, _resolutionConfig, context) => {
+    const ws: KotlinResolveContext = {
+      fromFile,
+      allFilePaths,
+      parsedFiles: context?.parsedFiles,
+    };
     return resolveKotlinImportTarget(
       { kind: 'named', localName: '_', importedName: '_', targetRaw },
       ws,
@@ -86,9 +102,36 @@ export const kotlinScopeResolver: ScopeResolver = {
 
   buildMro: (graph, parsedFiles, nodeLookup) => buildKotlinMro(graph, parsedFiles, nodeLookup),
 
+  // Worker-boundary restore (see `ScopeResolver.applyCaptureSideChannel`).
+  // `emitKotlinScopeCaptures` records per-file companion-object scope ids
+  // (`markCompanionScope` → `companionScopesByFile`) as a SIDE EFFECT — that
+  // state is NOT serialized onto the returned ParsedFile's scopes/defs. On the
+  // worker path those marks are populated in the worker process and lost across
+  // the MessageChannel / disk store; the main thread reuses the serialized
+  // ParsedFile and skips `extractParsedFile`, so `isKotlinStaticOnly` and
+  // `populateCompanionMembersOnEnclosingClass` (owners.ts) would see an empty
+  // map and companion/static dispatch would emit zero CALLS edges. The worker
+  // stashed a plain-data snapshot on `parsed.captureSideChannel` via
+  // `kotlinProvider.collectCaptureSideChannel`; this restores it into the
+  // module map WITHOUT any tree-sitter re-parse (the #1983 fix). The
+  // freshly-extracted leg never calls this — its marks were just populated in
+  // this process. Runs BEFORE `populateOwners` so the restored companion map is
+  // visible to it.
+  applyCaptureSideChannel: applyKotlinCaptureSideChannel,
+
   populateOwners: (parsed: ParsedFile) => populateKotlinOwners(parsed),
 
   isSuperReceiver: (text) => text.trim() === 'super',
+
+  // Subscript route only — Kotlin's collection views (`.values`, `.keys`) are
+  // properties on the stdlib types, resolved by the ordinary member walk rather
+  // than by unwrapping a generic here.
+  //
+  // Fed the annotation AS WRITTEN (`List<User>`, `Map<String, User>`), which
+  // `normalizeKotlinType` had already reduced to `User`. `undefined` means "not
+  // a container", so an `operator fun get` class does not fold `cache[k]` onto
+  // `Cache` itself.
+  elementTypeOf: indexOnlyElementType,
 
   isStaticOnly: isKotlinStaticOnly,
 
@@ -96,6 +139,16 @@ export const kotlinScopeResolver: ScopeResolver = {
   propagatesReturnTypesAcrossImports: true,
   collapseMemberCallsByCallerTarget: false,
   hoistTypeBindingsToModule: true,
+  freeCallsRequireInstanceOwnership: true,
+  postExtractSourceTextPolicy: 'uncached-files',
+  populateNamespaceSiblings: populateKotlinPackageSiblings,
+  emitPostResolutionEdges: (graph, parsedFiles, nodeLookup, indexes) => {
+    attachKotlinSpringBeanCandidateMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachKotlinSpringAopMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachKotlinSpringConditionalMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachKotlinSpringDiMetadata(graph, parsedFiles, nodeLookup, indexes);
+    attachKotlinSpringNonHttpHandlerMetadata(graph, parsedFiles, nodeLookup, indexes);
+  },
 };
 
 /**

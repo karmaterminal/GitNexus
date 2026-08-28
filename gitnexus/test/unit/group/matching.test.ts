@@ -100,6 +100,22 @@ describe('runExactMatch', () => {
     expect(matched).toHaveLength(2);
   });
 
+  it('matches a specific-method consumer to a method-agnostic (wildcard) provider', () => {
+    // A Django function view is method-agnostic (provider method '*'); a POST
+    // consumer on the same path must still match it.
+    const contracts: StoredContract[] = [
+      makeContract('http::*::/api/items', 'provider', 'backend'),
+      makeContract('http::POST::/api/items', 'consumer', 'frontend'),
+    ];
+
+    const { matched, unmatched } = runExactMatch(contracts);
+
+    expect(matched).toHaveLength(1);
+    expect(matched[0].from.repo).toBe('frontend');
+    expect(matched[0].to.repo).toBe('backend');
+    expect(unmatched).toHaveLength(0);
+  });
+
   it('reports unmatched contracts', () => {
     const contracts: StoredContract[] = [
       makeContract('http::GET::/api/users', 'provider', 'backend'),
@@ -620,9 +636,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('exclude_links_paths prevents cross-links for configured paths', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/ping'],
       exclude_links_param_only_paths: false,
     };
@@ -643,9 +656,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('excluded providers do not appear in matched', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/health'],
       exclude_links_param_only_paths: false,
     };
@@ -663,9 +673,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('excluded contracts do not appear in unmatched', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/ping'],
       exclude_links_param_only_paths: false,
     };
@@ -684,9 +691,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('exclude_links_param_only_paths filters /{param} and /{param}/{param}', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: [],
       exclude_links_param_only_paths: true,
     };
@@ -707,9 +711,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('mixed routes like /users/{param} are NOT excluded by param_only', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: [],
       exclude_links_param_only_paths: true,
     };
@@ -741,9 +742,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('trailing slash on contractId still matches configured exclusion', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/ping'],
       exclude_links_param_only_paths: false,
     };
@@ -762,9 +760,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('root path exclusion ["/"] suppresses http::GET::/ contracts', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/'],
       exclude_links_param_only_paths: false,
     };
@@ -786,9 +781,6 @@ describe('buildNoisyContractFilter (via runExactMatch)', () => {
 
   it('non-HTTP contracts are never filtered', () => {
     const matchingConfig: MatchingConfig = {
-      bm25_threshold: 0.7,
-      embedding_threshold: 0.65,
-      max_candidates_per_step: 3,
       exclude_links_paths: ['/ping'],
       exclude_links_param_only_paths: true,
     };

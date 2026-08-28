@@ -4,7 +4,7 @@ import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from '
  * LLM Client for Wiki Generation
  *
  * OpenAI-compatible API client using native fetch.
- * Supports OpenAI, Azure, LiteLLM, Ollama, and any OpenAI-compatible endpoint.
+ * Supports MiniMax and other OpenAI-compatible endpoints.
  *
  * Config priority: CLI flags > env vars > defaults
  */
@@ -16,7 +16,41 @@ export type LLMProvider =
   | 'custom'
   | 'cursor'
   | 'claude'
-  | 'codex';
+  | 'codex'
+  | 'opencode'
+  | 'minimax';
+
+export const MINIMAX_OPENAI_BASE_URLS = {
+  global_en: 'https://api.minimax.io/v1',
+  cn_zh: 'https://api.minimaxi.com/v1',
+} as const;
+
+export const MINIMAX_MODEL_IDS = ['MiniMax-M3', 'MiniMax-M2.7'] as const;
+
+export type MiniMaxThinkingMode = 'adaptive' | 'disabled' | 'always_on';
+
+export type LLMUserContent =
+  | string
+  | Array<
+      | { type: 'text'; text: string }
+      | {
+          type: 'image_url';
+          image_url: {
+            url: string;
+            detail?: 'low' | 'default' | 'high';
+            max_long_side_pixel?: number;
+          };
+        }
+      | {
+          type: 'video_url';
+          video_url: {
+            url: string;
+            detail?: 'low' | 'default' | 'high';
+            fps?: number;
+            max_long_side_pixel?: number;
+          };
+        }
+    >;
 
 export interface LLMConfig {
   apiKey: string;
@@ -34,12 +68,25 @@ export interface LLMConfig {
   requestTimeoutMs?: number;
   /** Max fetch attempts before giving up (default: 3). */
   maxAttempts?: number;
+  /** Exact hostnames allowed for explicit http:// LLM endpoints. */
+  allowedInsecureHttpHosts?: readonly string[];
 }
 
 export interface LLMResponse {
   content: string;
   promptTokens?: number;
   completionTokens?: number;
+}
+
+export function resolveMiniMaxThinkingMode(
+  model: string,
+  reasoningOverride?: boolean,
+): MiniMaxThinkingMode | undefined {
+  if (model === MINIMAX_MODEL_IDS[1]) return 'always_on';
+  if (model === MINIMAX_MODEL_IDS[0]) {
+    return reasoningOverride === false ? 'disabled' : 'adaptive';
+  }
+  return undefined;
 }
 
 /**
@@ -51,7 +98,11 @@ export interface LLMResponse {
 export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<LLMConfig> {
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
-  const savedProvider = overrides?.provider ?? savedConfig.provider;
+  const hasLegacyHttpConfig = !savedConfig.provider && !!(savedConfig.model || savedConfig.baseUrl);
+  const savedProvider =
+    overrides?.provider ?? savedConfig.provider ?? (hasLegacyHttpConfig ? 'openai' : 'minimax');
+  const reuseSavedHttpConfig =
+    savedConfig.provider === savedProvider || (hasLegacyHttpConfig && savedProvider === 'openai');
   const savedLocalModel =
     savedProvider === 'cursor'
       ? savedConfig.cursorModel
@@ -59,15 +110,21 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
         ? savedConfig.claudeModel
         : savedProvider === 'codex'
           ? savedConfig.codexModel
-          : undefined;
+          : savedProvider === 'opencode'
+            ? savedConfig.opencodeModel
+            : undefined;
   const localProvider =
-    savedProvider === 'cursor' || savedProvider === 'claude' || savedProvider === 'codex';
+    savedProvider === 'cursor' ||
+    savedProvider === 'claude' ||
+    savedProvider === 'codex' ||
+    savedProvider === 'opencode';
 
   const apiKey =
     overrides?.apiKey ||
-    process.env.GITNEXUS_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    savedConfig.apiKey ||
+    (savedProvider === 'minimax' ? process.env.MINIMAX_API_KEY : undefined) ||
+    (savedProvider !== 'minimax' ? process.env.GITNEXUS_API_KEY : undefined) ||
+    (savedProvider !== 'minimax' ? process.env.OPENAI_API_KEY : undefined) ||
+    (reuseSavedHttpConfig ? savedConfig.apiKey : undefined) ||
     '';
 
   return {
@@ -75,19 +132,31 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
     baseUrl:
       overrides?.baseUrl ||
       process.env.GITNEXUS_LLM_BASE_URL ||
-      savedConfig.baseUrl ||
-      'https://openrouter.ai/api/v1',
+      (reuseSavedHttpConfig ? savedConfig.baseUrl : undefined) ||
+      (savedProvider === 'minimax'
+        ? MINIMAX_OPENAI_BASE_URLS.global_en
+        : 'https://openrouter.ai/api/v1'),
     model:
       overrides?.model ||
       (localProvider ? undefined : process.env.GITNEXUS_MODEL) ||
       savedLocalModel ||
-      (localProvider ? '' : savedConfig.model || 'minimax/minimax-m2.5'),
+      (localProvider
+        ? ''
+        : (reuseSavedHttpConfig ? savedConfig.model : undefined) ||
+          (savedProvider === 'minimax' ? MINIMAX_MODEL_IDS[0] : '')),
     maxTokens: overrides?.maxTokens ?? 16_384,
     temperature: overrides?.temperature ?? 0,
-    provider: savedProvider ?? 'openai',
+    provider: savedProvider,
     apiVersion:
-      overrides?.apiVersion || process.env.GITNEXUS_AZURE_API_VERSION || savedConfig.apiVersion,
-    isReasoningModel: overrides?.isReasoningModel ?? savedConfig.isReasoningModel,
+      overrides?.apiVersion ||
+      (savedProvider === 'azure' ? process.env.GITNEXUS_AZURE_API_VERSION : undefined) ||
+      (reuseSavedHttpConfig ? savedConfig.apiVersion : undefined),
+    isReasoningModel:
+      overrides?.isReasoningModel ??
+      (reuseSavedHttpConfig ? savedConfig.isReasoningModel : undefined),
+    allowedInsecureHttpHosts:
+      overrides?.allowedInsecureHttpHosts ??
+      parseLLMAllowedInsecureHttpHosts(process.env[LLM_ALLOW_INSECURE_CONNECTION_ENV]),
   };
 }
 
@@ -111,6 +180,38 @@ function isTimeoutLikeError(err: unknown): boolean {
   return /time(d)?\s*out|timeout/i.test(err.message);
 }
 
+export const LLM_ALLOW_INSECURE_CONNECTION_ENV = 'GITNEXUS_ALLOW_INSECURE_CONNECTION';
+
+function normalizeAllowedInsecureHttpHost(host: string): string {
+  const trimmed = host.trim().toLowerCase();
+  const fail = () => {
+    throw new Error(
+      `--allow-insecure-connection / ${LLM_ALLOW_INSECURE_CONNECTION_ENV} entries must be exact hostnames or IP addresses`,
+    );
+  };
+  if (!trimmed || /[/@?#]/.test(trimmed)) fail();
+
+  if (trimmed.startsWith('[')) {
+    if (!trimmed.endsWith(']')) fail();
+    const normalized = trimmed.slice(1, -1);
+    if (!normalized || /[\[\]]/.test(normalized)) fail();
+    return normalized;
+  }
+
+  if (/[\[\]]/.test(trimmed)) fail();
+  if ((trimmed.match(/:/g)?.length ?? 0) === 1) {
+    // URL.hostname never includes the port, so accepting "host:port" would
+    // create a confusing no-op allowlist entry.
+    fail();
+  }
+  return trimmed;
+}
+
+export function parseLLMAllowedInsecureHttpHosts(value: string | undefined): string[] {
+  if (value === undefined || value.trim() === '') return [];
+  return [...new Set(value.split(',').map(normalizeAllowedInsecureHttpHost))];
+}
+
 /**
  * Validate that a base URL supplied for LLM API calls is a safe HTTP/HTTPS
  * endpoint (CWE-918 / CodeQL js/http-to-file-access).
@@ -118,15 +219,22 @@ function isTimeoutLikeError(err: unknown): boolean {
  * Allowed:
  *  - https:// with any hostname (public LLM APIs, Azure, OpenRouter, …)
  *  - http:// restricted to localhost / 127.0.0.1 (local servers: Ollama, LiteLLM, …)
+ *  - http:// to exact hosts explicitly allowlisted for LAN/self-hosted LLMs
  *
  * Rejected:
  *  - file://, data:, javascript:, and any other non-HTTP scheme
- *  - http:// aimed at non-loopback hosts (avoids SSRF against internal networks)
+ *  - http:// aimed at non-loopback hosts unless explicitly allowlisted
+ *    (avoids SSRF against internal networks by default)
  *
  * Throws with a descriptive message on validation failure so callers surface a
  * clear error rather than an opaque network error.
  */
-export function validateLLMBaseUrl(baseUrl: string): void {
+export function validateLLMBaseUrl(
+  baseUrl: string,
+  allowedInsecureHttpHosts: readonly string[] = parseLLMAllowedInsecureHttpHosts(
+    process.env[LLM_ALLOW_INSECURE_CONNECTION_ENV],
+  ),
+): void {
   let parsed: URL;
   try {
     parsed = new URL(baseUrl);
@@ -144,10 +252,12 @@ export function validateLLMBaseUrl(baseUrl: string): void {
     // Node's URL parser preserves IPv6 brackets in hostname (e.g. "[::1]"),
     // so strip them before comparing to bare address literals.
     const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1') {
+    const allowedHosts = new Set(allowedInsecureHttpHosts.map(normalizeAllowedInsecureHttpHost));
+    if (host !== 'localhost' && host !== '127.0.0.1' && host !== '::1' && !allowedHosts.has(host)) {
       // Use parsed.origin (scheme+host+port, no credentials) instead of the full URL.
       throw new Error(
-        `Insecure http:// LLM base URLs are only allowed for localhost/127.0.0.1. ` +
+        `Insecure http:// LLM base URLs are only allowed for localhost/127.0.0.1 ` +
+          `or hosts listed by --allow-insecure-connection / ${LLM_ALLOW_INSECURE_CONNECTION_ENV}. ` +
           `Use https:// for remote endpoints (got ${parsed.origin})`,
       );
     }
@@ -200,15 +310,15 @@ export interface CallLLMOptions {
  * Retries up to 3 times on transient failures (429, 5xx, network errors).
  */
 export async function callLLM(
-  prompt: string,
+  prompt: LLMUserContent,
   config: LLMConfig,
   systemPrompt?: string,
   options?: CallLLMOptions,
 ): Promise<LLMResponse> {
   // Validate base URL before any fetch (CodeQL js/http-to-file-access)
-  validateLLMBaseUrl(config.baseUrl);
+  validateLLMBaseUrl(config.baseUrl, config.allowedInsecureHttpHosts);
 
-  const messages: Array<{ role: string; content: string }> = [];
+  const messages: Array<{ role: string; content: LLMUserContent }> = [];
   if (systemPrompt) {
     messages.push({ role: 'system', content: systemPrompt });
   }
@@ -224,8 +334,15 @@ export async function callLLM(
     );
   }
 
-  // Detect reasoning model (o1, o3, o4-mini etc.) or explicit override
-  const reasoning = isReasoningModel(config.model, config.isReasoningModel);
+  const miniMaxThinkingMode =
+    config.provider === 'minimax'
+      ? resolveMiniMaxThinkingMode(config.model, config.isReasoningModel)
+      : undefined;
+
+  // Detect reasoning models or explicit provider-specific thinking configuration.
+  const reasoning = miniMaxThinkingMode
+    ? miniMaxThinkingMode !== 'disabled'
+    : isReasoningModel(config.model, config.isReasoningModel);
 
   const url = buildRequestUrl(config.baseUrl, azure ? config.apiVersion : undefined);
   const useStream = !!options?.onChunk;
@@ -235,6 +352,13 @@ export async function callLLM(
     model: config.model,
     messages,
   };
+
+  if (miniMaxThinkingMode === 'adaptive' || miniMaxThinkingMode === 'disabled') {
+    body.thinking = { type: miniMaxThinkingMode };
+  }
+  if (config.provider === 'minimax') {
+    body.reasoning_split = true;
+  }
 
   // max_tokens is deprecated; use max_completion_tokens for all models
   body.max_completion_tokens = config.maxTokens;

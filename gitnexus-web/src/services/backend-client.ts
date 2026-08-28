@@ -8,6 +8,12 @@
 
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
+import {
+  AUTH_TOKEN_STORAGE_KEY,
+  LARGE_GRAPH_NODE_THRESHOLD,
+  LARGE_GRAPH_EDGE_THRESHOLD,
+} from '../config/ui-constants';
+import { decideSkipGraph } from '../lib/graph-load-decision';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -25,6 +31,13 @@ export interface BackendRepo {
     processes?: number;
   };
 }
+
+/**
+ * Canonical repo identity: the registry path. The display `name` is ambiguous
+ * across duplicate repo names (#2419); `repoPath` is the normalized field and
+ * `path` the legacy list-endpoint field.
+ */
+export const repoIdentity = (repo: BackendRepo): string => repo.repoPath ?? repo.path ?? repo.name;
 
 export interface EnrichedSearchResult {
   filePath: string;
@@ -79,7 +92,16 @@ export class BackendError extends Error {
       | 'client'
       | 'not_found'
       | 'timeout'
-      | 'rate_limited',
+      | 'rate_limited'
+      // The write-route same-host Origin guard rejected this request (HTTP 403
+      // with `{ code: 'origin_not_allowed' }`). Distinct from a generic `client`
+      // 403 so the UI can show actionable "open the local UI" guidance.
+      | 'origin_blocked'
+      // The public edge rejected this request for a missing or wrong deploy
+      // access token (HTTP 401 with `{ code: 'unauthorized' }`). Distinct from a
+      // generic `client` 4xx so the UI can prompt for the token instead of
+      // showing a raw error.
+      | 'unauthorized',
     /**
      * Milliseconds until the caller should retry. Populated for rate-limited
      * responses (HTTP 429) from the server's `Retry-After` header. `undefined`
@@ -92,38 +114,97 @@ export class BackendError extends Error {
   }
 }
 
+/**
+ * Thrown by the graph stream parser when the streamed node/relationship count
+ * crosses the size limit mid-download (#2178). It is the backstop for the case
+ * pre-fetch stats can't cover (absent/stale `stats.nodes`/`stats.edges` on a
+ * genuinely large repo). `connectToServer` catches it and falls into chat-only
+ * mode instead of letting the full graph hang the browser.
+ */
+export class GraphTooLargeError extends Error {
+  constructor(
+    message: string,
+    public readonly nodeCount: number,
+    public readonly relationshipCount: number,
+  ) {
+    super(message);
+    this.name = 'GraphTooLargeError';
+  }
+}
+
 // ── SSE Utility ────────────────────────────────────────────────────────────
 
 export interface SSEHandlers<T = unknown> {
   onMessage?: (data: T) => void;
   onComplete?: (data: T) => void;
   onError?: (error: string) => void;
+  /** Fires on every successful (re)connection, once the stream is readable. */
+  onOpen?: () => void;
+  /**
+   * Fires each time a reconnect is scheduled after a drop. Callers that want
+   * "notify once per outage" dedupe on their side, resetting in `onOpen`.
+   */
+  onReconnecting?: () => void;
+}
+
+export interface SSEOptions {
+  /** Reconnect attempts after a drop. `Infinity` for an indefinite stream. Default 3. */
+  maxRetries?: number;
+  /** First backoff delay; doubles per attempt. Default 1000ms. */
+  baseDelayMs?: number;
+  /** Upper bound on the doubling backoff. Default unbounded. */
+  capDelayMs?: number;
+  /**
+   * Reconnect on a non-OK HTTP response as well as on a network drop. Off by
+   * default: a job-progress stream that 4xx's is a real, terminal error the
+   * caller has to see. A long-lived liveness stream turns it on, so a 401 from
+   * the edge's token gate resolves itself once a token is entered.
+   */
+  retryOnHttpError?: boolean;
 }
 
 /**
  * Generic SSE stream consumer using fetch + ReadableStream.
  * Returns an AbortController to cancel the stream.
- * Automatically reconnects on network drops (up to 3 retries with backoff).
+ * Automatically reconnects on network drops (up to `maxRetries` with backoff).
+ *
+ * fetch-based rather than `EventSource` because `EventSource` cannot send
+ * custom headers, and every `/api/*` request needs the `Authorization` header
+ * to clear the public edge's token gate.
  */
-export function streamSSE<T = unknown>(url: string, handlers: SSEHandlers<T>): AbortController {
+export function streamSSE<T = unknown>(
+  url: string,
+  handlers: SSEHandlers<T>,
+  options: SSEOptions = {},
+): AbortController {
   const controller = new AbortController();
-  const MAX_RETRIES = 3;
-  const BASE_DELAY_MS = 1_000;
+  const maxRetries = options.maxRetries ?? 3;
+  const baseDelayMs = options.baseDelayMs ?? 1_000;
+  const capDelayMs = options.capDelayMs ?? Infinity;
 
   let lastEventId = '';
+
+  /** Schedule the next attempt. Returns false when the budget is spent. */
+  const scheduleRetry = (retryCount: number): boolean => {
+    if (controller.signal.aborted || retryCount >= maxRetries) return false;
+    handlers.onReconnecting?.();
+    setTimeout(() => connect(retryCount + 1), Math.min(baseDelayMs * 2 ** retryCount, capDelayMs));
+    return true;
+  };
 
   const connect = (retryCount: number) => {
     if (controller.signal.aborted) return;
 
     (async () => {
       try {
-        const headers: Record<string, string> = {};
+        const headers = withAuthHeader(new Headers());
         if (lastEventId) {
-          headers['Last-Event-ID'] = lastEventId;
+          headers.set('Last-Event-ID', lastEventId);
         }
 
         const response = await fetch(url, { signal: controller.signal, headers });
         if (!response.ok) {
+          if (options.retryOnHttpError && scheduleRetry(retryCount)) return;
           handlers.onError?.(`Server returned ${response.status}`);
           return;
         }
@@ -136,6 +217,7 @@ export function streamSSE<T = unknown>(url: string, handlers: SSEHandlers<T>): A
 
         // Reset retry count on successful connection
         retryCount = 0;
+        handlers.onOpen?.();
 
         const decoder = new TextDecoder();
         let buffer = '';
@@ -182,15 +264,11 @@ export function streamSSE<T = unknown>(url: string, handlers: SSEHandlers<T>): A
         }
 
         // Stream ended without terminal event — try to reconnect
-        if (!controller.signal.aborted && retryCount < MAX_RETRIES) {
-          setTimeout(() => connect(retryCount + 1), BASE_DELAY_MS * 2 ** retryCount);
-        }
+        scheduleRetry(retryCount);
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
         // Network error — attempt reconnect with backoff
-        if (!controller.signal.aborted && retryCount < MAX_RETRIES) {
-          setTimeout(() => connect(retryCount + 1), BASE_DELAY_MS * 2 ** retryCount);
-        } else {
+        if (!scheduleRetry(retryCount)) {
           handlers.onError?.(err instanceof Error ? err.message : 'Stream error');
         }
       }
@@ -257,6 +335,67 @@ export function normalizeServerUrl(input: string): string {
   return url;
 }
 
+// ── Access token ───────────────────────────────────────────────────────────
+
+/**
+ * Deploy access token, sent as `Authorization: Bearer <token>` on every
+ * `/api/*` request. `''` when the deploy has no gate, which is a valid state;
+ * `null` means "not yet read from storage". See AUTH_TOKEN_STORAGE_KEY for why
+ * sessionStorage and why a header rather than a cookie.
+ */
+let _authToken: string | null = null;
+
+const readStoredAuthToken = (): string => {
+  try {
+    if (typeof sessionStorage === 'undefined') return '';
+    return sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? '';
+  } catch {
+    // Storage can throw in private browsing modes — treat as no token.
+    return '';
+  }
+};
+
+/** The current access token, or `''` when the deploy is ungated. */
+export const getAuthToken = (): string => {
+  if (_authToken === null) {
+    _authToken = readStoredAuthToken();
+  }
+  return _authToken;
+};
+
+/**
+ * Store the access token for this browser session. A whitespace-only token
+ * clears it, which is how the header is disabled for an ungated local backend.
+ */
+export const setAuthToken = (token: string): void => {
+  const trimmed = token.trim();
+  _authToken = trimmed;
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    if (trimmed) {
+      sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, trimmed);
+    } else {
+      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  } catch (error) {
+    // Persist failure is non-fatal: the in-memory token still authorizes this
+    // tab's requests. Log the failure, never the token.
+    console.warn('Failed to persist the GitNexus access token to sessionStorage:', error);
+  }
+};
+
+/**
+ * Add `Authorization` to a header set, in place. With no token the header is
+ * omitted rather than sent empty: an empty credential is malformed, not absent.
+ */
+const withAuthHeader = (headers: Headers): Headers => {
+  const token = getAuthToken();
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  return headers;
+};
+
 // ── Internal Helpers ───────────────────────────────────────────────────────
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -283,15 +422,20 @@ const fetchWithTimeout = async (
 ): Promise<Response> => {
   // Merge the external caller signal (if any) with an
   // `AbortSignal.timeout()` so a timer-fired abort produces a
-  // `DOMException` with `name === 'TimeoutError'` — which
-  // `resilientFetch` correctly classifies as terminal-network (no
-  // retry, no breaker hit). A manual `AbortController.abort()` would
-  // produce `name === 'AbortError'` and route through the
-  // retryable-network branch, which mis-penalizes the breaker for
-  // user-side network slowness.
+  // `DOMException` with `name === 'TimeoutError'`. Both shapes are
+  // breaker-safe: `resilientFetch` classifies TimeoutError AND a manual
+  // `AbortController.abort()`'s AbortError as terminal-network (no
+  // retry, breaker-neutral via recordNeutral), so caller-driven
+  // cancellation never penalizes the breaker.
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const externalSignal = init.signal;
   const signal = externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal;
+
+  // Single chokepoint for the deploy access token — every REST call routes
+  // through here. `Headers` rather than an object spread because callers pass
+  // their own `headers` (e.g. `Content-Type: application/json`) and a spread
+  // would drop one side or the other depending on ordering.
+  const headers = withAuthHeader(new Headers(init.headers));
 
   const method = (init.method ?? 'GET').toUpperCase();
   const isIdempotent = IDEMPOTENT_METHODS.has(method);
@@ -318,7 +462,7 @@ const fetchWithTimeout = async (
     // single-attempt to avoid duplicate side effects.
     const response = await resilientFetch(
       url,
-      { ...init, signal },
+      { ...init, headers, signal },
       {
         breakerKey,
         retry: { maxAttempts, baseDelayMs: 250, capDelayMs: 1500 },
@@ -362,12 +506,16 @@ const assertOk = async (response: Response): Promise<void> => {
   if (response.ok) return;
 
   let message = response.statusText;
+  let bodyCode: string | undefined;
   try {
     const body = await response.json();
     if (body && typeof body.error === 'string') {
       message = body.error;
     } else if (body && typeof body.message === 'string') {
       message = body.message;
+    }
+    if (body && typeof body.code === 'string') {
+      bodyCode = body.code;
     }
   } catch {
     // Response body was not JSON
@@ -378,9 +526,17 @@ const assertOk = async (response: Response): Promise<void> => {
       ? 'not_found'
       : response.status === 429
         ? 'rate_limited'
-        : response.status >= 400 && response.status < 500
-          ? 'client'
-          : 'server';
+        : // The public edge's token gate returns 401 with this discriminator;
+          // surface it as a distinct code so the UI can prompt for the token.
+          bodyCode === 'unauthorized'
+          ? 'unauthorized'
+          : // The write-route Origin guard returns 403 with this discriminator;
+            // surface it as a distinct code so the UI can give actionable guidance.
+            bodyCode === 'origin_not_allowed'
+            ? 'origin_blocked'
+            : response.status >= 400 && response.status < 500
+              ? 'client'
+              : 'server';
 
   // Retry-After is the standard HTTP signal for when the client may try again.
   // express-rate-limit emits it on 429 with seconds (integer) or HTTP-date.
@@ -422,6 +578,8 @@ export const fetchServerInfo = async (): Promise<ServerInfo> => {
   return response.json() as Promise<ServerInfo>;
 };
 
+const HEARTBEAT_MAX_BACKOFF_MS = 15_000;
+
 /**
  * Connect an SSE heartbeat to the backend. Retries indefinitely with capped
  * exponential backoff so transient hiccups don't reset the UI.
@@ -430,53 +588,42 @@ export const fetchServerInfo = async (): Promise<ServerInfo> => {
  * - `onReconnecting` fires on the first retry after a drop — use it to show
  *   a "reconnecting" banner while keeping the current view intact.
  *
- * Returns a cleanup function that tears down the EventSource and timers.
+ * Runs on `streamSSE` rather than `EventSource`: `EventSource` cannot send
+ * custom headers, so it can't clear the edge's token gate, and the heartbeat
+ * would 401 forever on a gated deploy. `streamSSE` reconnects on a non-OK
+ * response here (`retryOnHttpError`), so a 401 recovers on its own once the
+ * user enters a token instead of needing a page reload.
+ *
+ * Returns a cleanup function that aborts the stream and its pending retry.
  */
 export const connectHeartbeat = (
   onConnect: () => void,
   onReconnecting: () => void,
 ): (() => void) => {
-  let closed = false;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
-  let es: EventSource | null = null;
-  let attempt = 0;
   /** Whether we've already fired onReconnecting for the current drop. */
   let notifiedReconnecting = false;
-  const MAX_BACKOFF_MS = 15_000;
 
-  const connect = () => {
-    if (closed) return;
-    es = new EventSource(`${_backendUrl}/api/heartbeat`);
-    es.onopen = () => {
-      if (!closed) {
-        attempt = 0;
+  const controller = streamSSE(
+    `${_backendUrl}/api/heartbeat`,
+    {
+      onOpen: () => {
         notifiedReconnecting = false;
         onConnect();
-      }
-    };
-    es.onerror = () => {
-      es?.close();
-      es = null;
-      if (closed) return;
-
-      if (!notifiedReconnecting) {
+      },
+      onReconnecting: () => {
+        if (notifiedReconnecting) return;
         notifiedReconnecting = true;
         onReconnecting();
-      }
+      },
+    },
+    {
+      maxRetries: Infinity,
+      capDelayMs: HEARTBEAT_MAX_BACKOFF_MS,
+      retryOnHttpError: true,
+    },
+  );
 
-      const delay = Math.min(1_000 * Math.pow(2, attempt), MAX_BACKOFF_MS);
-      attempt++;
-      retryTimer = setTimeout(connect, delay);
-    };
-  };
-
-  connect();
-
-  return () => {
-    closed = true;
-    es?.close();
-    if (retryTimer) clearTimeout(retryTimer);
-  };
+  return () => controller.abort();
 };
 
 /** Delete a repo's index and unregister it. */
@@ -490,13 +637,29 @@ export const deleteRepo = async (repoName: string): Promise<void> => {
   await assertOk(response);
 };
 
-/** Probe the backend. Returns true if reachable. */
-export const probeBackend = async (): Promise<boolean> => {
+/**
+ * Outcome of a backend probe. A single value rather than a pair of booleans,
+ * so "reachable and gated at the same time" cannot be represented:
+ * - `ok` — answered 200, reachable and authorized.
+ * - `unauthorized` — the public edge rejected the probe for a missing or wrong
+ *   access token (401). The deploy is up; the fix is to enter a token, not to
+ *   start a server.
+ * - `unreachable` — no usable answer: a transport failure, a timeout, or any
+ *   other status.
+ */
+export type BackendProbeStatus = 'ok' | 'unauthorized' | 'unreachable';
+
+/**
+ * Probe the backend, distinguishing "not there" from "there but gated".
+ * Never throws — a probe failure is a state, not an error.
+ */
+export const probeBackendStatus = async (): Promise<BackendProbeStatus> => {
   try {
     const response = await fetchWithTimeout(`${_backendUrl}/api/repos`, {}, PROBE_TIMEOUT_MS);
-    return response.status === 200;
+    if (response.status === 200) return 'ok';
+    return response.status === 401 ? 'unauthorized' : 'unreachable';
   } catch {
-    return false;
+    return 'unreachable';
   }
 };
 
@@ -504,7 +667,8 @@ export const probeBackend = async (): Promise<boolean> => {
 export const fetchRepos = async (): Promise<BackendRepo[]> => {
   const response = await fetchWithTimeout(`${_backendUrl}/api/repos`);
   await assertOk(response);
-  return response.json() as Promise<BackendRepo[]>;
+  const repos = (await response.json()) as BackendRepo[];
+  return repos.map((r) => ({ ...r, repoPath: r.repoPath ?? r.path }));
 };
 
 /** Fetch repo metadata.
@@ -528,13 +692,18 @@ export const fetchRepoInfo = async (
   return { ...data, repoPath: data.repoPath ?? data.path };
 };
 
-/** Fetch the graph (nodes + relationships). Content stripped by default. */
+/** Fetch the graph (nodes + relationships). Content stripped by default.
+ * `maxNodes`/`maxEdges` arm a streaming circuit breaker (#2178): if the streamed
+ * count crosses either limit, the download aborts with a GraphTooLargeError
+ * instead of materializing a graph that would hang the browser. Off by default. */
 export const fetchGraph = async (
   repo?: string,
   opts?: {
     includeContent?: boolean;
     signal?: AbortSignal;
     onProgress?: (downloaded: number, total: number | null) => void;
+    maxNodes?: number;
+    maxEdges?: number;
   },
 ): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const params = [repoParam(repo), opts?.includeContent ? 'includeContent=true' : '', 'stream=true']
@@ -547,7 +716,7 @@ export const fetchGraph = async (
 
   const contentType = response.headers.get('Content-Type') || '';
   if (contentType.includes('application/x-ndjson')) {
-    return parseNdjsonGraphResponse(response, opts?.onProgress);
+    return parseNdjsonGraphResponse(response, opts?.onProgress, opts?.maxNodes, opts?.maxEdges);
   }
 
   if (!opts?.onProgress || !response.body) {
@@ -581,6 +750,8 @@ export const fetchGraph = async (
 const parseNdjsonGraphResponse = async (
   response: Response,
   onProgress?: (downloaded: number, total: number | null) => void,
+  maxNodes?: number,
+  maxEdges?: number,
 ): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   if (!response.body) {
     throw new BackendError('No response body', response.status, 'server');
@@ -594,6 +765,14 @@ const parseNdjsonGraphResponse = async (
   const relationships: GraphRelationship[] = [];
   let buffer = '';
   let downloaded = 0;
+
+  // Streaming circuit breaker (#2178): enforce the size limits mid-download as a
+  // backstop when pre-fetch stats were missing. Same `> threshold` comparison as
+  // decideSkipGraph. Throwing immediately after the offending push means a later
+  // error record in the same chunk is never reached — the breaker wins.
+  const overLimit = (): boolean =>
+    (typeof maxNodes === 'number' && nodes.length > maxNodes) ||
+    (typeof maxEdges === 'number' && relationships.length > maxEdges);
 
   const parseLine = (line: string) => {
     const trimmed = line.trim();
@@ -617,6 +796,20 @@ const parseNdjsonGraphResponse = async (
     }
   };
 
+  const tripBreaker = async () => {
+    // Free the socket promptly; never let a cancel rejection mask the breaker.
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore — we're aborting anyway
+    }
+    throw new GraphTooLargeError(
+      `Graph exceeds the size limit (nodes=${nodes.length}, relationships=${relationships.length})`,
+      nodes.length,
+      relationships.length,
+    );
+  };
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -629,11 +822,13 @@ const parseNdjsonGraphResponse = async (
     buffer = lines.pop() || '';
     for (const line of lines) {
       parseLine(line);
+      if (overLimit()) await tripBreaker();
     }
   }
 
   buffer += decoder.decode();
   parseLine(buffer);
+  if (overLimit()) await tripBreaker();
 
   return { nodes, relationships };
 };
@@ -755,6 +950,35 @@ export const fetchClusterDetail = async (repo: string, name: string): Promise<un
   return response.json();
 };
 
+// ── Upload API ─────────────────────────────────────────────────────────────
+
+/**
+ * Upload a folder (selected via `<input webkitdirectory>`) and start analysis.
+ * Sends the file blobs plus a JSON `manifest` of their relative paths — the
+ * multipart filename can't carry the path (browsers strip separators), so the
+ * manifest is the source of truth. Routed through fetchWithTimeout (the shared,
+ * origin-validated request path) rather than a raw XHR; returns the analysis
+ * jobId, which the caller drives through the normal SSE flow.
+ */
+export const uploadFolder = async (
+  files: File[],
+  manifest: string[],
+  signal?: AbortSignal,
+): Promise<{ jobId: string; status: string }> => {
+  const form = new FormData();
+  // Manifest MUST precede the file parts (the server enforces this).
+  form.append('manifest', JSON.stringify(manifest));
+  for (const f of files) form.append('files', f);
+
+  const response = await fetchWithTimeout(
+    `${_backendUrl}/api/analyze/upload`,
+    { method: 'POST', body: form, signal },
+    5 * 60_000, // up to 5 min for large repos
+  );
+  await assertOk(response);
+  return response.json() as Promise<{ jobId: string; status: string }>;
+};
+
 // ── Analyze API ────────────────────────────────────────────────────────────
 
 /** Start a server-side analysis job. */
@@ -763,6 +987,7 @@ export const startAnalyze = async (request: {
   path?: string;
   force?: boolean;
   embeddings?: boolean;
+  token?: string;
 }): Promise<{ jobId: string; status: string }> => {
   const response = await fetchWithTimeout(
     `${_backendUrl}/api/analyze`,
@@ -799,7 +1024,7 @@ export const cancelAnalyze = async (jobId: string): Promise<void> => {
 export const streamAnalyzeProgress = (
   jobId: string,
   onProgress: (progress: JobProgress) => void,
-  onComplete: (data: { repoName?: string }) => void,
+  onComplete: (data: { repoName?: string; repoPath?: string }) => void,
   onError: (error: string) => void,
 ): AbortController => {
   return streamSSE<JobProgress>(
@@ -848,7 +1073,7 @@ export const cancelEmbeddings = async (jobId: string): Promise<void> => {
 export const streamEmbeddingProgress = (
   jobId: string,
   onProgress: (progress: JobProgress) => void,
-  onComplete: (data: { repoName?: string }) => void,
+  onComplete: (data: { repoName?: string; repoPath?: string }) => void,
   onError: (error: string) => void,
 ): AbortController => {
   return streamSSE<JobProgress>(`${_backendUrl}/api/embed/${encodeURIComponent(jobId)}/progress`, {
@@ -864,6 +1089,14 @@ export interface ConnectResult {
   nodes: GraphNode[];
   relationships: GraphRelationship[];
   repoInfo: BackendRepo;
+  /**
+   * True when the graph download was skipped (chat-only mode) — either because
+   * the caller asked for it or because the project exceeded the auto-detect
+   * node threshold. When true, `nodes`/`relationships` are empty and graph
+   * visualization is unavailable, but AI chat and all backend-API features
+   * work normally. See issue #2178.
+   */
+  graphSkipped: boolean;
 }
 
 /**
@@ -871,13 +1104,15 @@ export interface ConnectResult {
  * Content is NOT included (use readFile/grep for file access).
  * Pass `awaitAnalysis: true` when the repo may still be cloning/analyzing —
  * this enables the backend hold-queue and a 5-minute fetch timeout.
+ * Pass `skipGraph: true`/`false` to force chat-only / full-graph mode; omit it
+ * to auto-detect from the project's node count (LARGE_GRAPH_NODE_THRESHOLD).
  */
 export async function connectToServer(
   url: string,
   onProgress?: (phase: string, downloaded: number, total: number | null) => void,
   signal?: AbortSignal,
   repoName?: string,
-  opts?: { awaitAnalysis?: boolean },
+  opts?: { awaitAnalysis?: boolean; skipGraph?: boolean },
 ): Promise<ConnectResult> {
   const baseUrl = normalizeServerUrl(url);
   setBackendUrl(baseUrl);
@@ -885,11 +1120,45 @@ export async function connectToServer(
   onProgress?.('validating', 0, null);
   const repoInfo = await fetchRepoInfo(repoName, { awaitAnalysis: opts?.awaitAnalysis });
 
-  onProgress?.('downloading', 0, null);
-  const { nodes, relationships } = await fetchGraph(repoName, {
-    signal,
-    onProgress: (downloaded, total) => onProgress?.('downloading', downloaded, total),
+  // Decide whether to skip the (potentially huge) graph download. The AI chat
+  // talks to the backend HTTP API directly and does not need the in-memory
+  // graph, so for large projects — or when the caller explicitly asked for
+  // chat-only mode — we connect instantly without materializing the graph.
+  // repoInfo is already fetched above, so the node-count check costs no extra
+  // round-trip. See issue #2178.
+  const skipGraph = decideSkipGraph({
+    explicit: opts?.skipGraph,
+    nodeCount: repoInfo.stats?.nodes,
+    threshold: LARGE_GRAPH_NODE_THRESHOLD,
+    edgeCount: repoInfo.stats?.edges,
+    edgeThreshold: LARGE_GRAPH_EDGE_THRESHOLD,
   });
 
-  return { nodes, relationships, repoInfo };
+  if (skipGraph) {
+    return { nodes: [], relationships: [], repoInfo, graphSkipped: true };
+  }
+
+  // Arm the streaming circuit breaker for auto-detect downloads as a backstop
+  // for the no-stats fail-open case (#2178). An explicit "load anyway"
+  // (skipGraph === false) opts out — the user has accepted the cost.
+  const enforceLimits = opts?.skipGraph !== false;
+
+  onProgress?.('downloading', 0, null);
+  try {
+    const { nodes, relationships } = await fetchGraph(repoName, {
+      signal,
+      onProgress: (downloaded, total) => onProgress?.('downloading', downloaded, total),
+      maxNodes: enforceLimits ? LARGE_GRAPH_NODE_THRESHOLD : undefined,
+      maxEdges: enforceLimits ? LARGE_GRAPH_EDGE_THRESHOLD : undefined,
+    });
+    return { nodes, relationships, repoInfo, graphSkipped: false };
+  } catch (err) {
+    // The breaker tripped mid-stream → fall into chat-only, the same result the
+    // pre-fetch skip path produces. Re-throw every other error (genuine
+    // BackendErrors must still surface to the caller's catch).
+    if (err instanceof GraphTooLargeError) {
+      return { nodes: [], relationships: [], repoInfo, graphSkipped: true };
+    }
+    throw err;
+  }
 }
