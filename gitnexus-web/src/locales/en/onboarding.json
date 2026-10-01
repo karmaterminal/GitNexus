@@ -31,7 +31,7 @@
   },
   "analyzeFirst": {
     "title": "Analyze your first repository",
-    "description": "Paste a GitHub URL and GitNexus will clone it, parse the code, and build a live knowledge graph — right in your browser.",
+    "description": "Paste a repository URL and GitNexus will clone it, parse the code, and build a live knowledge graph — right in your browser.",
     "footer": "Public repos only · Cloned locally by the server · No data leaves your machine"
   },
   "landing": {
@@ -51,6 +51,7 @@
     "inputType": "Input type",
     "githubUrl": "GitHub URL",
     "gitlabUrl": "GitLab URL",
+    "azureDevOpsUrl": "Azure DevOps",
     "localFolder": "Local Folder",
     "starting": "Starting analysis...",
     "analyzeRepository": "Analyze Repository",
@@ -58,10 +59,27 @@
     "loadingGraph": "Loading graph...",
     "defaultRepoName": "repository",
     "githubRepositoryUrl": "GitHub Repository URL",
+    "githubTokenLabel": "Personal Access Token (optional)",
+    "githubTokenPlaceholder": "ghp_… or github_pat_…",
+    "githubTokenHelp": "Required for private repos. Needs the 'repo' (or fine-grained Contents:read) scope. Sent once, not stored.",
     "gitlabRepositoryUrl": "GitLab Repository URL",
     "gitlabSupported": "Supports GitLab.com and self-hosted GitLab instances.",
+    "azureDevOpsRepositoryUrl": "Azure DevOps Repository URL",
+    "azureDevOpsSupported": "Format: https://dev.azure.com/organization/project/_git/repository",
     "localFolderPath": "Local Folder Path",
-    "browseForFolder": "Browse for folder",
-    "hideBackground": "Hide (analysis continues in background)"
+    "hideBackground": "Hide (analysis continues in background)",
+    "upload": {
+      "button": "Upload a folder",
+      "uploading": "Uploading…",
+      "selected": "{{fileCount}} files ready ({{dropped}} skipped: .git, node_modules, build output)",
+      "selectedDrop": "{{fileCount, number}} files ready ({{skippedDirs, number}} folders and {{dropped, number}} files skipped: .git, node_modules, build output, files over 25 MB)",
+      "empty": "No analyzable files found in that folder.",
+      "dropHint": "or drop a folder here",
+      "dropActive": "Release to upload this folder",
+      "reading": "Reading folder… {{fileCount, number}} files found",
+      "dropSingleFolder": "Drop a single folder, not files or several folders.",
+      "dropTooManyFiles": "That folder holds more than {{max, number}} files. Drop a subfolder instead.",
+      "dropUnsupported": "This browser cannot read a dropped folder. Use the “Upload a folder” button instead."
+    }
   }
 }

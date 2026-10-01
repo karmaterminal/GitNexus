@@ -31,7 +31,7 @@
   },
   "analyzeFirst": {
     "title": "分析你的第一个仓库",
-    "description": "粘贴 GitHub URL，GitNexus 会克隆仓库、解析代码，并直接在浏览器中构建实时知识图谱。",
+    "description": "粘贴仓库 URL，GitNexus 会克隆仓库、解析代码，并直接在浏览器中构建实时知识图谱。",
     "footer": "仅支持公开仓库 · 服务器本地克隆 · 数据不会离开你的机器"
   },
   "landing": {
@@ -51,6 +51,7 @@
     "inputType": "输入类型",
     "githubUrl": "GitHub URL",
     "gitlabUrl": "GitLab URL",
+    "azureDevOpsUrl": "Azure DevOps",
     "localFolder": "本地文件夹",
     "starting": "正在启动分析...",
     "analyzeRepository": "分析仓库",
@@ -58,10 +59,27 @@
     "loadingGraph": "正在加载图数据...",
     "defaultRepoName": "仓库",
     "githubRepositoryUrl": "GitHub 仓库 URL",
+    "githubTokenLabel": "个人访问令牌（可选）",
+    "githubTokenPlaceholder": "ghp_… 或 github_pat_…",
+    "githubTokenHelp": "私有仓库需要此项。需 'repo' 范围（或细粒度 Contents:read）。仅发送一次，不会保存。",
     "gitlabRepositoryUrl": "GitLab 仓库 URL",
     "gitlabSupported": "支持 GitLab.com 和自托管 GitLab 实例。",
+    "azureDevOpsRepositoryUrl": "Azure DevOps 仓库 URL",
+    "azureDevOpsSupported": "格式: http://server/Collection/Project/_git/Repository",
     "localFolderPath": "本地文件夹路径",
-    "browseForFolder": "浏览文件夹",
-    "hideBackground": "隐藏（分析继续在后台进行）"
+    "hideBackground": "隐藏（分析继续在后台进行）",
+    "upload": {
+      "button": "上传文件夹",
+      "uploading": "上传中…",
+      "selected": "已准备 {{fileCount}} 个文件（已跳过 {{dropped}} 个：.git、node_modules、构建产物）",
+      "selectedDrop": "已准备 {{fileCount, number}} 个文件（已跳过 {{skippedDirs, number}} 个文件夹和 {{dropped, number}} 个文件：.git、node_modules、构建产物、超过 25 MB 的文件）",
+      "empty": "该文件夹中未找到可分析的文件。",
+      "dropHint": "或将文件夹拖放到此处",
+      "dropActive": "松开以上传此文件夹",
+      "reading": "正在读取文件夹… 已找到 {{fileCount, number}} 个文件",
+      "dropSingleFolder": "请拖放单个文件夹，而不是文件或多个文件夹。",
+      "dropTooManyFiles": "该文件夹的文件超过 {{max, number}} 个，请改为拖放子文件夹。",
+      "dropUnsupported": "此浏览器无法读取拖放的文件夹，请改用“上传文件夹”按钮。"
+    }
   }
 }

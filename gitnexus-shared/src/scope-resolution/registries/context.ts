@@ -136,6 +136,8 @@ export interface RegistryContext {
 
 export const CLASS_KINDS: readonly NodeLabel[] = Object.freeze([
   'Class',
+  'Protocol',
+  'Category',
   'Interface',
   'Enum',
   'Struct',
@@ -162,3 +164,10 @@ export const FIELD_KINDS: readonly NodeLabel[] = Object.freeze([
   'Const',
   'Static',
 ]);
+
+// Macros occupy a namespace disjoint from functions/methods: a `log!`
+// invocation must resolve ONLY to a `macro_rules! log` definition, never
+// to a same-named `fn log`. `MACRO_KINDS` is therefore a singleton
+// (`['Macro']`) and is NOT merged into METHOD_KINDS — keeping the two
+// keyspaces separate is what prevents the cross-namespace false-edge.
+export const MACRO_KINDS: readonly NodeLabel[] = Object.freeze(['Macro']);

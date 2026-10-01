@@ -4,13 +4,12 @@
  * isolating the resolution cost from parse / heritage / pipeline
  * overhead.
  *
- * Usage: REGISTRY_PRIMARY_PYTHON=1 npx tsx scripts/bench-scope-resolution.ts
+ * Usage: npx tsx scripts/bench-scope-resolution.ts
  */
-process.env.REGISTRY_PRIMARY_PYTHON = '1';
-
 import { generateId } from '../src/lib/utils.js';
 import { createKnowledgeGraph } from '../src/core/graph/graph.js';
-import { runScopeResolution } from '../src/core/ingestion/scope-resolution/index.js';
+import { createSemanticModel } from '../src/core/ingestion/model/semantic-model.js';
+import { runScopeResolution } from '../src/core/ingestion/scope-resolution/pipeline/run.js';
 import { pythonScopeResolver } from '../src/core/ingestion/languages/python/scope-resolver.js';
 
 const N_CLASSES = Number(process.env.BENCH_CLASSES ?? '60');
@@ -108,14 +107,20 @@ async function main() {
   // Warmup
   for (let i = 0; i < 2; i++) {
     const graph = buildGraph(files);
-    await runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
+    await runScopeResolution(
+      { graph, model: createSemanticModel(), files, onWarn: () => {} },
+      pythonScopeResolver,
+    );
   }
 
   const samples: number[] = [];
   for (let i = 0; i < ITERS; i++) {
     const graph = buildGraph(files);
     const start = process.hrtime.bigint();
-    await runScopeResolution({ graph, files, onWarn: () => {} }, pythonScopeResolver);
+    await runScopeResolution(
+      { graph, model: createSemanticModel(), files, onWarn: () => {} },
+      pythonScopeResolver,
+    );
     const end = process.hrtime.bigint();
     const ms = Number(end - start) / 1_000_000;
     samples.push(ms);

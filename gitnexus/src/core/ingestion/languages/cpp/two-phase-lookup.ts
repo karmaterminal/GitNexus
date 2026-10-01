@@ -47,6 +47,13 @@ import { findEnclosingClassDef } from '../../scope-resolution/scope/walkers.js';
 const dependentBasesByFile = new Map<string, Map<string, Map<string, Set<string>>>>();
 
 /**
+ * Class templates with pack-expanded bases (`struct Mix : Bases...`) have
+ * an unknown set of base classes. Unqualified member lookup inside the class
+ * cannot safely bind to class-owned methods outside the current class.
+ */
+const dependentPackBaseClassesByFile = new Map<string, Set<string>>();
+
+/**
  * Post-`populateOwners` resolution: per-class-nodeId, the set of
  * dependent-base-class nodeIds. Built by `populateCppDependentBases`
  * from `dependentBasesByFile` + the workspace registry.
@@ -88,9 +95,69 @@ export function markCppDependentBase(
   quals.add(qualifier);
 }
 
+export function markCppDependentPackBase(filePath: string, className: string): void {
+  let perFile = dependentPackBaseClassesByFile.get(filePath);
+  if (perFile === undefined) {
+    perFile = new Set();
+    dependentPackBaseClassesByFile.set(filePath, perFile);
+  }
+  perFile.add(className);
+}
+
+/**
+ * Plain-data, JSON-serializable snapshot of the per-file capture-time
+ * two-phase-lookup state. Carried on `ParsedFile.captureSideChannel` across the
+ * worker→main boundary (#1983). The resolved `dependentBaseNodeIds` index is
+ * rebuilt by `populateCppDependentBases` (workspace pass) after all files have
+ * their `populateOwners` applied, so only the two capture-time maps cross.
+ *
+ * Nested `Map`/`Set` are flattened to arrays here so the snapshot stays plain
+ * JSON (avoids relying on the parsedfile-store's Map/Set replacer for nested
+ * structures): `dependentBases` is `[className, [baseName, qualifiers[]][]][]`.
+ */
+export interface CppTwoPhaseSideChannel {
+  readonly dependentBases: readonly [string, readonly [string, readonly string[]][]][];
+  readonly dependentPackBaseClasses: readonly string[];
+}
+
+/** Snapshot this file's two-phase-lookup capture state for the side-channel. */
+export function collectCppTwoPhaseSideChannel(filePath: string): CppTwoPhaseSideChannel {
+  const perFile = dependentBasesByFile.get(filePath);
+  const dependentBases: [string, [string, string[]][]][] = [];
+  if (perFile !== undefined) {
+    for (const [className, bases] of perFile) {
+      const baseEntries: [string, string[]][] = [];
+      for (const [baseName, quals] of bases) {
+        baseEntries.push([baseName, [...quals]]);
+      }
+      dependentBases.push([className, baseEntries]);
+    }
+  }
+  const pack = dependentPackBaseClassesByFile.get(filePath);
+  return {
+    dependentBases,
+    dependentPackBaseClasses: pack === undefined ? [] : [...pack],
+  };
+}
+
+/** Restore this file's two-phase-lookup capture state from the side-channel. */
+export function applyCppTwoPhaseSideChannel(filePath: string, data: CppTwoPhaseSideChannel): void {
+  for (const [className, baseEntries] of data.dependentBases) {
+    for (const [baseName, quals] of baseEntries) {
+      for (const qualifier of quals) {
+        markCppDependentBase(filePath, className, baseName, qualifier);
+      }
+    }
+  }
+  for (const className of data.dependentPackBaseClasses) {
+    markCppDependentPackBase(filePath, className);
+  }
+}
+
 /** Clear two-phase-lookup state. Called from `clearFileLocalNames`. */
 export function clearCppDependentBases(): void {
   dependentBasesByFile.clear();
+  dependentPackBaseClassesByFile.clear();
   dependentBaseNodeIds.clear();
 }
 
@@ -110,7 +177,7 @@ export function clearCppDependentBases(): void {
  *     found (conservative: avoids false associations).
  */
 export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): void {
-  if (dependentBasesByFile.size === 0) return;
+  if (dependentBasesByFile.size === 0 && dependentPackBaseClassesByFile.size === 0) return;
 
   // Build workspace-wide index: simpleName → {nodeId, nsPrefix}[]
   // nsPrefix is the dot-joined namespace path (qualifiedName without the
@@ -162,6 +229,16 @@ export function populateCppDependentBases(parsedFiles: readonly ParsedFile[]): v
       if (simple === '') continue;
       const nsPrefix = lastDot >= 0 ? qn.slice(0, lastDot) : '';
       localClassByName.set(simple, { nodeId: def.nodeId, nsPrefix });
+    }
+
+    const packBaseClasses = dependentPackBaseClassesByFile.get(filePath);
+    if (packBaseClasses !== undefined) {
+      for (const className of packBaseClasses) {
+        const classEntry = localClassByName.get(className);
+        if (classEntry !== undefined) {
+          dependentBaseNodeIds.set(classEntry.nodeId, new Set(['*pack-expansion*']));
+        }
+      }
     }
 
     // V3: qualifier-based exact targeting. When the base specifier carries
@@ -270,10 +347,31 @@ export function isCppDependentBaseMember(
   candidateDef: SymbolDefinition,
   scopes: ScopeResolutionIndexes,
 ): boolean {
-  if (candidateDef.ownerId === undefined) return false;
   const enclosing = findEnclosingClassDef(callerScopeId, scopes);
   if (enclosing === undefined) return false;
   const bases = dependentBaseNodeIds.get(enclosing.nodeId);
   if (bases === undefined) return false;
+  if (bases.has('*pack-expansion*')) {
+    if (candidateDef.ownerId !== undefined) return candidateDef.ownerId !== enclosing.nodeId;
+    if (candidateDef.type !== 'Method' && candidateDef.type !== 'Constructor') return false;
+    const ownerName = getQualifiedParentName(candidateDef.qualifiedName);
+    const enclosingName = getQualifiedSimpleName(enclosing.qualifiedName);
+    return ownerName !== undefined && ownerName !== enclosingName;
+  }
+  if (candidateDef.ownerId === undefined) return false;
   return bases.has(candidateDef.ownerId);
+}
+
+function getQualifiedParentName(qualifiedName: string | undefined): string | undefined {
+  if (qualifiedName === undefined) return undefined;
+  const lastDot = qualifiedName.lastIndexOf('.');
+  if (lastDot < 0) return undefined;
+  const parent = qualifiedName.slice(0, lastDot);
+  return getQualifiedSimpleName(parent);
+}
+
+function getQualifiedSimpleName(qualifiedName: string | undefined): string | undefined {
+  if (qualifiedName === undefined) return undefined;
+  const lastDot = qualifiedName.lastIndexOf('.');
+  return lastDot >= 0 ? qualifiedName.slice(lastDot + 1) : qualifiedName;
 }

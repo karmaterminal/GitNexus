@@ -9,6 +9,8 @@ import {
   WorkerPoolDispatchError,
   resolveWorkerPoolOptions,
   resolveAutoPoolSize,
+  workerPoolDisabledByEnv,
+  crashSignature,
 } from '../../src/core/ingestion/workers/worker-pool.js';
 /**
  * The pool now sends sub-batch dispatches via native `worker.postMessage`
@@ -56,7 +58,7 @@ let workerInstances: FakeWorker[] = [];
 class FakeWorker extends EventEmitter {
   readonly seenMessages: unknown[] = [];
 
-  constructor() {
+  constructor(startupExitCode?: number) {
     super();
     workerInstances.push(this);
     // Real Worker fires 'online' asynchronously after the runtime is ready;
@@ -65,6 +67,10 @@ class FakeWorker extends EventEmitter {
     // message instead — emit that too so replacement-worker tests don't
     // hit the WORKER_READY_TIMEOUT_MS budget (5s).
     queueMicrotask(() => {
+      if (startupExitCode !== undefined) {
+        this.emit('exit', startupExitCode);
+        return;
+      }
       this.emit('online');
       this.emit('message', { type: 'ready' });
     });
@@ -184,6 +190,8 @@ describe('worker pool resilience', () => {
       // from a circuit-breaker trip. Fresh pool has not been
       // terminated.
       terminated: false,
+      // #1741: no startup backoff is pending once every slot reached ready.
+      pendingStartupTimers: 0,
       // U12: every slot starts at generation 0; no respawns yet on a
       // fresh pool. Per-slot zeros (not a single scalar) because each
       // slot tracks its own respawn history independently.
@@ -218,6 +226,8 @@ describe('worker pool resilience', () => {
       poolBroken: false,
       // F16: pool is still alive (just lost a slot); terminated=false.
       terminated: false,
+      // #1741: a runtime death is unrelated to startup backoff timers.
+      pendingStartupTimers: 0,
       // U12: slot 0 was dropped before any successful respawn (budget=0),
       // so its generation stays at 0. Slot 1 never died, also 0.
       slotGenerations: [0, 0],
@@ -256,8 +266,8 @@ describe('worker pool resilience', () => {
       consecutiveFailureThreshold: 10,
       maxRespawnsPerSlot: 1,
     });
-    // Slot 0 dies twice, exceeding budget=1; slot 1 succeeds with the
-    // requeued remainder.
+    // Separate dispatches target the first live slot twice, independently
+    // of how multi-file packs are split across workers.
     nextActions.push({ kind: 'crash-exit', code: 134, afterStartingFiles: 1 });
     nextActions.push({ kind: 'crash-exit', code: 134, afterStartingFiles: 1 });
     nextActions.push({
@@ -266,9 +276,10 @@ describe('worker pool resilience', () => {
       result: { fileCount: 2 },
     });
 
+    await pool.dispatch([{ path: 'src/a.ts', content: '' }]);
+    await pool.dispatch([{ path: 'src/b.ts', content: '' }]);
+    expect(pool.getStats().activeSlots).toBe(1);
     const results = await pool.dispatch<{ path: string; content: string }, unknown>([
-      { path: 'src/a.ts', content: '' },
-      { path: 'src/b.ts', content: '' },
       { path: 'src/c.ts', content: '' },
       { path: 'src/d.ts', content: '' },
     ]);
@@ -489,18 +500,13 @@ describe('worker pool resilience', () => {
     await pool.terminate();
   });
 
-  it('drops slot when waitForWorkerOnline rejects (replaceWorker failure path)', async () => {
+  it('drops slot when replacement readiness rejects', async () => {
     let factoryCallCount = 0;
     const pool = createWorkerPool(workerUrl, 2, {
       workerFactory: () => {
         factoryCallCount++;
-        const worker = new FakeWorker();
-        // Slot 0's initial worker is healthy; the replacement (3rd factory
-        // call after slot 0 dies once) exits before emitting 'online'.
-        if (factoryCallCount === 3) {
-          // Override the queued 'online' microtask with an immediate 'exit'.
-          queueMicrotask(() => worker.emit('exit', 1));
-        }
+        // The replacement exits INSTEAD OF reporting ready.
+        const worker = new FakeWorker(factoryCallCount === 3 ? 1 : undefined);
         return worker as unknown as import('node:worker_threads').Worker;
       },
       consecutiveFailureThreshold: 10,
@@ -513,8 +519,9 @@ describe('worker pool resilience', () => {
       result: { fileCount: 2 },
     });
 
+    await pool.dispatch([{ path: 'src/a.ts', content: '' }]);
+    expect(pool.getStats().activeSlots).toBe(1);
     const results = await pool.dispatch<{ path: string; content: string }, unknown>([
-      { path: 'src/a.ts', content: '' },
       { path: 'src/b.ts', content: '' },
       { path: 'src/c.ts', content: '' },
     ]);
@@ -525,6 +532,33 @@ describe('worker pool resilience', () => {
     expect(factoryCallCount).toBe(3);
     await pool.terminate();
   });
+
+  it('finishes recovery when a failed worker never acknowledges termination', async () => {
+    const pool = createWorkerPool(workerUrl, 2, {
+      workerFactory: () => {
+        const worker = new FakeWorker();
+        if (workerInstances.length === 1) {
+          worker.terminate = () => new Promise<number>(() => {});
+        }
+        return worker as unknown as import('node:worker_threads').Worker;
+      },
+      shutdownDrainMs: 10,
+    });
+    nextActions.push({ kind: 'crash-exit', code: 134, afterStartingFiles: 1 });
+    nextActions.push({ kind: 'parse-ok', files: [{ path: 'src/good.ts' }] });
+    try {
+      const results = await pool.dispatch([
+        { path: 'src/bad.ts', content: '' },
+        { path: 'src/good.ts', content: '' },
+      ]);
+      expect(results).toEqual([{ fileCount: 1 }]);
+      expect(pool.getQuarantinedPaths()).toEqual(['src/bad.ts']);
+      expect(pool.getStats().slotGenerations).toEqual([1, 0]);
+      expect(pool.getStats().activeSlots).toBe(2);
+    } finally {
+      await pool.terminate();
+    }
+  }, 1000);
 
   it('trips the breaker when all slots exhaust their respawn budget', async () => {
     const pool = createWorkerPool(workerUrl, 2, {
@@ -642,5 +676,59 @@ describe('resolveAutoPoolSize', () => {
 
   it('returns an integer (never a float)', () => {
     expect(Number.isInteger(resolveAutoPoolSize())).toBe(true);
+  });
+});
+
+describe('workerPoolDisabledByEnv (#1741 — env=0 → sequential signal)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is true only for a literal GITNEXUS_WORKER_POOL_SIZE=0', () => {
+    vi.stubEnv('GITNEXUS_WORKER_POOL_SIZE', '0');
+    expect(workerPoolDisabledByEnv()).toBe(true);
+  });
+
+  it('is false for a positive env size (the pool is used)', () => {
+    vi.stubEnv('GITNEXUS_WORKER_POOL_SIZE', '4');
+    expect(workerPoolDisabledByEnv()).toBe(false);
+  });
+
+  it('treats empty/whitespace as unset (not a disable signal — auto formula applies)', () => {
+    vi.stubEnv('GITNEXUS_WORKER_POOL_SIZE', '');
+    expect(workerPoolDisabledByEnv()).toBe(false);
+    vi.stubEnv('GITNEXUS_WORKER_POOL_SIZE', '   ');
+    expect(workerPoolDisabledByEnv()).toBe(false);
+  });
+
+  it('is false for an invalid value', () => {
+    vi.stubEnv('GITNEXUS_WORKER_POOL_SIZE', 'abc');
+    expect(workerPoolDisabledByEnv()).toBe(false);
+  });
+});
+
+describe('crashSignature (#1741 — deterministic-loop fingerprint normalization)', () => {
+  it('collapses Windows backslash temp paths that differ only in a random token', () => {
+    const a = crashSignature("Cannot find module 'C:\\Users\\ci\\Temp\\worker-7f3a.js'");
+    const b = crashSignature("Cannot find module 'C:\\Users\\ci\\Temp\\worker-2b9c.js'");
+    expect(a).toBe(b);
+  });
+
+  it('collapses bare (no-0x) hex backtrace tokens', () => {
+    expect(crashSignature('SIGSEGV at 00007f8a2b1c4d')).toBe(
+      crashSignature('SIGSEGV at 00007fcc3d2e5a'),
+    );
+  });
+
+  it('collapses POSIX paths and exit codes (stderr-less crashes still group)', () => {
+    expect(crashSignature('Worker exited with code 1 (/tmp/pool-9/w.js)')).toBe(
+      crashSignature('Worker exited with code 139 (/tmp/pool-4/w.js)'),
+    );
+  });
+
+  it('keeps genuinely different crashes distinct', () => {
+    expect(crashSignature('Error: Cannot find module tree-sitter-c-sharp')).not.toBe(
+      crashSignature('Error: out of memory'),
+    );
   });
 });

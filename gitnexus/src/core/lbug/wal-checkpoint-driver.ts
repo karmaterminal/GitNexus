@@ -34,6 +34,7 @@
 
 import { logger } from '../logger.js';
 import { tryFlushWAL } from './lbug-adapter.js';
+import { markWalDriverActive } from './wal-driver-state.js';
 import { isLbugCheckpointIoError } from './lbug-config.js';
 
 /**
@@ -117,6 +118,9 @@ export const runCheckpointWithRetry = async (
     { attempts: CHECKPOINT_RETRY_ATTEMPTS },
     'GitNexus: manual WAL checkpoint exhausted retry budget — surfacing IO error to caller',
   );
+  // The held-open cause (#2599) is named at the CLI layer (analyze.ts) where the
+  // --wal-checkpoint-threshold recovery hint already renders, so the original IO
+  // error is preserved intact for that classifier rather than re-wrapped here.
   throw lastError;
 };
 
@@ -126,11 +130,15 @@ export const runCheckpointWithRetry = async (
  *
  * Honors the `GITNEXUS_WAL_MANUAL_CHECKPOINT=0` opt-out so operators can
  * disable the manual path if it ever interacts badly with a future
- * Ladybug release.
+ * Ladybug release. Returns true only when a CHECKPOINT actually flushed
+ * (`tryFlushWAL` → true). Opt-out and a no-op flush (no open connection)
+ * both return false so an FTS park warrant cannot treat a skipped
+ * checkpoint as success.
  */
-export const checkpointOnce = async (): Promise<void> => {
-  if (!isManualCheckpointEnabled()) return;
-  await runCheckpointWithRetry();
+export const checkpointOnce = async (): Promise<boolean> => {
+  if (!isManualCheckpointEnabled()) return false;
+  const { flushed } = await runCheckpointWithRetry();
+  return flushed;
 };
 
 /** Default cadence (ms) for the periodic driver. */
@@ -162,8 +170,20 @@ export const startWalCheckpointDriver = (
   let stopped = false;
   let inflight: Promise<void> | null = null;
 
+  // Arm the streamQuery guard: while this driver runs, an unlocked streamQuery on
+  // the singleton connection could race a CHECKPOINT (#2264). Cleared in stop().
+  markWalDriverActive(true);
+
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    // Reentrancy guard: setInterval keeps firing on its fixed cadence even when
+    // the previous checkpoint has not settled (a CHECKPOINT can outlast the
+    // period during a large `--pdg` writeback). Without this, each overdue tick
+    // would queue another CHECKPOINT — they now serialize on the connection lock
+    // (lbug-adapter `withConnLock`), but letting them pile up is still pointless
+    // work and widens the window for a backlog at stop(). Skip while one is in
+    // flight; the next tick covers any WAL accumulated in the meantime.
+    if (inflight) return;
     inflight = runCheckpointWithRetry()
       .then(() => undefined)
       .catch((err) => {
@@ -210,6 +230,9 @@ export const startWalCheckpointDriver = (
           /* swallowed in tick() — surface path is the surrounding write */
         }
       }
+      // Disarm AFTER the in-flight CHECKPOINT drains — clearing it earlier would
+      // briefly let a streamQuery race the still-finishing CHECKPOINT (#2264).
+      markWalDriverActive(false);
     },
   };
 };

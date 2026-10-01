@@ -18,6 +18,7 @@ import {
   initWikiDb,
   closeWikiDb,
   touchWikiDb,
+  pinWikiDb,
   getFilesWithExports,
   getAllFiles,
   getIntraModuleCallEdges,
@@ -39,7 +40,13 @@ import {
 } from './llm-client.js';
 
 import { callCursorLLM, resolveCursorConfig } from './cursor-client.js';
-import { callClaudeLLM, callCodexLLM, resolveLocalCLIConfig } from './local-cli-client.js';
+import { callGrokLLM, resolveGrokConfig } from './grok-client.js';
+import {
+  callClaudeLLM,
+  callCodexLLM,
+  callOpenCodeLLM,
+  resolveLocalCLIConfig,
+} from './local-cli-client.js';
 
 import {
   GROUPING_SYSTEM_PROMPT,
@@ -219,15 +226,32 @@ export class WikiGenerator {
       });
       return callCursorLLM(prompt, cursorConfig, systemPrompt, options);
     }
-    if (this.llmConfig.provider === 'claude' || this.llmConfig.provider === 'codex') {
+    if (this.llmConfig.provider === 'grok') {
+      const grokConfig = resolveGrokConfig({
+        model: this.llmConfig.model,
+        requestTimeoutMs: this.llmConfig.requestTimeoutMs,
+      });
+      return callGrokLLM(prompt, grokConfig, systemPrompt, options);
+    }
+    if (
+      this.llmConfig.provider === 'claude' ||
+      this.llmConfig.provider === 'codex' ||
+      this.llmConfig.provider === 'opencode'
+    ) {
       const localConfig = resolveLocalCLIConfig({
         model: this.llmConfig.model,
         workingDirectory: this.repoPath,
         requestTimeoutMs: this.llmConfig.requestTimeoutMs,
       });
-      return this.llmConfig.provider === 'claude'
-        ? callClaudeLLM(prompt, localConfig, systemPrompt, options)
-        : callCodexLLM(prompt, localConfig, systemPrompt, options);
+      if (this.llmConfig.provider === 'claude') {
+        return callClaudeLLM(prompt, localConfig, systemPrompt, options);
+      }
+      if (this.llmConfig.provider === 'codex') {
+        return callCodexLLM(prompt, localConfig, systemPrompt, options);
+      }
+      if (this.llmConfig.provider === 'opencode') {
+        return callOpenCodeLLM(prompt, localConfig, systemPrompt, options);
+      }
     }
     return callLLM(prompt, this.llmConfig, systemPrompt, options);
   }
@@ -276,6 +300,7 @@ export class WikiGenerator {
 
     // Init graph
     this.onProgress('init', 2, 'Connecting to knowledge graph...');
+    const releaseWikiDbPin = pinWikiDb();
     await initWikiDb(this.lbugPath);
 
     let result: WikiRunResult;
@@ -295,6 +320,7 @@ export class WikiGenerator {
         result = await this.fullGeneration(currentCommit);
       }
     } finally {
+      releaseWikiDbPin();
       await closeWikiDb();
     }
 

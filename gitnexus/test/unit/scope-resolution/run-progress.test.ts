@@ -7,6 +7,7 @@ import {
 import { createKnowledgeGraph } from '../../../src/core/graph/graph.js';
 import { createSemanticModel } from '../../../src/core/ingestion/model/semantic-model.js';
 import type { ScopeResolver } from '../../../src/core/ingestion/scope-resolution/contract/scope-resolver.js';
+import type { LanguageProvider } from '../../../src/core/ingestion/language-provider.js';
 
 const mkScope = (id: ScopeId, filePath: string): Scope => ({
   id,
@@ -39,6 +40,12 @@ const stubProvider = {
   buildMro: () => new Map(),
   propagatesReturnTypesAcrossImports: false,
 } as unknown as ScopeResolver;
+
+const providerWithEmitter = (emitScopeCaptures: LanguageProvider['emitScopeCaptures']) =>
+  ({
+    ...stubProvider,
+    languageProvider: { emitScopeCaptures } as LanguageProvider,
+  }) as ScopeResolver;
 
 describe('runScopeResolution onProgress', () => {
   it('emits sub-phases in order for a 3-file input', async () => {
@@ -103,5 +110,93 @@ describe('runScopeResolution onProgress', () => {
 
     expect(stats.filesProcessed).toBe(0);
     expect(calls).toEqual([{ subPhase: 'extracting', current: 0, total: 0 }]);
+  });
+
+  it('yields to the event loop during the scope-resolution cascade', async () => {
+    const files = Array.from({ length: 256 }, (_, index) => ({
+      path: `file-${index}.py`,
+      content: '',
+    }));
+    const preExtracted = new Map<string, ParsedFile>(
+      files.map((file) => [file.path, mkFile(file.path)]),
+    );
+    let eventLoopTurnObserved = false;
+    setImmediate(() => {
+      eventLoopTurnObserved = true;
+    });
+
+    await runScopeResolution(
+      {
+        graph: createKnowledgeGraph(),
+        model: createSemanticModel(),
+        files,
+        preExtractedParsedFiles: preExtracted,
+      },
+      stubProvider,
+    );
+
+    expect(eventLoopTurnObserved).toBe(true);
+  });
+
+  it('rejects when a provider hook fails', async () => {
+    const files = [{ path: 'broken.py', content: '' }];
+    const rejectingProvider = {
+      ...stubProvider,
+      populateOwners: () => {
+        throw new Error('populate failed');
+      },
+    };
+
+    await expect(
+      runScopeResolution(
+        {
+          graph: createKnowledgeGraph(),
+          model: createSemanticModel(),
+          files,
+          preExtractedParsedFiles: new Map([['broken.py', mkFile('broken.py')]]),
+        },
+        rejectingProvider,
+      ),
+    ).rejects.toThrow('populate failed');
+  });
+
+  it('counts empty migrated files as skipped without recording extraction failures', async () => {
+    const stats = await runScopeResolution(
+      {
+        graph: createKnowledgeGraph(),
+        model: createSemanticModel(),
+        files: [
+          { path: 'empty.py', content: '' },
+          { path: 'whitespace.py', content: ' \n\t' },
+        ],
+      },
+      providerWithEmitter(() => {
+        throw new Error('empty files must short-circuit before capture');
+      }),
+    );
+
+    expect(stats.filesProcessed).toBe(0);
+    expect(stats.filesSkipped).toBe(2);
+    expect(stats.scopeExtractionFailedPaths).toEqual([]);
+  });
+
+  it('records a warned emitter failure as a final extraction omission', async () => {
+    const warnings: string[] = [];
+    const stats = await runScopeResolution(
+      {
+        graph: createKnowledgeGraph(),
+        model: createSemanticModel(),
+        files: [{ path: 'broken.py', content: 'value = 1' }],
+        onWarn: (warning) => warnings.push(warning),
+      },
+      providerWithEmitter(() => {
+        throw new Error('capture failed');
+      }),
+    );
+
+    expect(stats.filesProcessed).toBe(0);
+    expect(stats.filesSkipped).toBe(1);
+    expect(stats.scopeExtractionFailedPaths).toEqual(['broken.py']);
+    expect(warnings).toEqual([expect.stringContaining('capture failed')]);
   });
 });

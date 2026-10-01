@@ -7,6 +7,7 @@ import {
   type BackendRepo,
 } from '../services/backend-client';
 import { useBackend } from '../hooks/useBackend';
+import { AccessTokenPrompt } from './AccessTokenPrompt';
 import { OnboardingGuide } from './OnboardingGuide';
 import { AnalyzeOnboarding } from './AnalyzeOnboarding';
 import { RepoLanding } from './RepoLanding';
@@ -147,6 +148,7 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
   const {
     isConnected,
     isProbing,
+    isUnauthorized,
     startPolling,
     stopPolling,
     isPolling,
@@ -206,6 +208,10 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
       const abortController = new AbortController();
       abortControllerRef.current = abortController;
       try {
+        // Landing-screen repo selection auto-detects by size (#2178). The
+        // ?skipGraph URL param is a bookmark hint for the initial auto-connect
+        // only; honoring a stale value for a different repo here would risk the
+        // hang it is meant to prevent.
         const result = await connectToServer(
           detectedBackendUrl,
           (p, downloaded, total) => {
@@ -306,8 +312,20 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
           </div>
         )}
 
+        {/* The backend is up but gated — asking for a token is the only useful
+            thing to show. The "run gitnexus serve" guide would be wrong advice. */}
+        {isUnauthorized && !isConnected && (
+          <AccessTokenPrompt
+            onSubmit={() => {
+              // The polling chain is already running while disconnected; it
+              // picks up the new token on its next tick and auto-connects.
+              if (!isPolling) startPolling();
+            }}
+          />
+        )}
+
         {/* Crossfade between phases */}
-        {displayPhase && (
+        {!isUnauthorized && displayPhase && (
           <Crossfade activeKey={displayPhase}>
             {displayPhase === 'onboarding' && <OnboardingGuide isPolling={isPolling} />}
             {displayPhase === 'analyze' && <AnalyzeOnboarding onComplete={connectToRepo} />}

@@ -13,6 +13,7 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { STORAGE_VERSION_MISMATCH_SUGGESTION } from '../../src/core/lbug/lbug-config.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,27 @@ const SCHEMA_MOCK = {
   SCHEMA_QUERIES: ['CREATE NODE TABLE IF NOT EXISTS File (id STRING, PRIMARY KEY(id))'],
 };
 
+const schemaMockFactory = async () => ({
+  ...(await vi.importActual<typeof import('../../src/core/lbug/schema.js')>(
+    '../../src/core/lbug/schema.js',
+  )),
+  ...SCHEMA_MOCK,
+});
+
+async function mockLbugConfigForStorageVersion(overrides: Record<string, unknown>) {
+  const actual = await vi.importActual<typeof import('../../src/core/lbug/lbug-config.js')>(
+    '../../src/core/lbug/lbug-config.js',
+  );
+  vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
+    ...actual,
+    isDbBusyError: vi.fn(() => false),
+    isOpenRetryExhausted: vi.fn(() => false),
+    isWalCorruptionError: vi.fn(() => false),
+    waitForWindowsHandleRelease: vi.fn(async () => true),
+    ...overrides,
+  }));
+}
+
 function makeFsMock(dbPath: string) {
   const ENOENT = Object.assign(new Error(`ENOENT: ${dbPath}`), { code: 'ENOENT' });
   return {
@@ -44,6 +66,10 @@ function makeFsMock(dbPath: string) {
       rename: vi.fn(async () => {}),
       mkdir: vi.fn(async () => {}),
       open: makeOpenMock(),
+      readdir: vi.fn(async () => []),
+      readFile: vi.fn(async () => {
+        throw ENOENT;
+      }),
     },
   };
 }
@@ -96,6 +122,42 @@ describe('doInitLbug WAL corruption guard — structural', () => {
     expect(warnIdx).toBeGreaterThan(-1);
     expect(walGuardIdx).toBeLessThan(warnIdx);
   });
+
+  it('refuses a read-only FTS crash before preflight', () => {
+    const readOnlyBlock = adapterSource.slice(adapterSource.indexOf('if (readOnly)'));
+    const refuseIdx = readOnlyBlock.indexOf('assertReadOnlyFtsCrashSafe(dbPath)');
+    const preflightIdx = readOnlyBlock.indexOf('preflightLbugSidecars');
+    expect(refuseIdx).toBeGreaterThan(-1);
+    expect(preflightIdx).toBeGreaterThan(refuseIdx);
+  });
+
+  it('writable missing-shadow reopen can pass FTS crash evidence; read-only must not', () => {
+    const evidenceStart = adapterSource.indexOf('const writableFtsCrashWalEvidence');
+    const writableStart = adapterSource.indexOf('const reopenWritableAfterMissingShadow');
+    const readOnlyStart = adapterSource.indexOf('const reopenReadOnlyAfterMissingShadow');
+    expect(evidenceStart).toBeGreaterThan(-1);
+    expect(writableStart).toBeGreaterThan(evidenceStart);
+    expect(readOnlyStart).toBeGreaterThan(-1);
+    expect(adapterSource.slice(evidenceStart, writableStart + 600)).toMatch(
+      /fts-inplace-checkpointed/,
+    );
+    expect(adapterSource.slice(writableStart, writableStart + 600)).toMatch(
+      /writableFtsCrashWalEvidence/,
+    );
+    expect(adapterSource.slice(readOnlyStart, evidenceStart)).not.toMatch(
+      /fts-inplace-checkpointed/,
+    );
+  });
+
+  it('imports throwIfStorageVersionMismatch and uses it in the schema catch', () => {
+    expect(adapterSource).toMatch(/throwIfStorageVersionMismatch/);
+    expect(schemaLoopBody).toMatch(/isStorageVersionMismatchError\(err\)/);
+    expect(schemaLoopBody).toMatch(/throwIfStorageVersionMismatch\(err\)/);
+    const mismatchIdx = schemaLoopBody.indexOf('isStorageVersionMismatchError(err)');
+    const warnIdx = schemaLoopBody.indexOf('Schema creation warning');
+    expect(mismatchIdx).toBeGreaterThan(-1);
+    expect(mismatchIdx).toBeLessThan(warnIdx);
+  });
 });
 
 // ─── Behavioural tests ────────────────────────────────────────────────────────
@@ -126,7 +188,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const db = { close: vi.fn(async () => {}) };
 
     vi.doMock('fs/promises', () => makeFsMock(dbPath));
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: vi.fn(async () => ({ db, conn })),
       closeLbugConnection: vi.fn(async () => {}),
@@ -139,6 +201,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -181,7 +246,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const warnMock = vi.fn();
 
     vi.doMock('fs/promises', () => makeFsMock(dbPath));
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: vi.fn(async () => ({ db, conn })),
       closeLbugConnection: vi.fn(async () => {}),
@@ -191,6 +256,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -239,7 +307,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const warnMock = vi.fn();
 
     vi.doMock('fs/promises', () => fsMock);
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: openLbugConnectionMock,
       closeLbugConnection: async (handle: { conn: typeof firstConn; db: typeof firstDb }) => {
@@ -252,6 +320,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -294,7 +365,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const warnMock = vi.fn();
 
     vi.doMock('fs/promises', () => makeFsMock(dbPath));
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: openLbugConnectionMock,
       closeLbugConnection: vi.fn(async () => {}),
@@ -304,6 +375,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -365,7 +439,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const ensureMock = vi.fn(async () => false);
 
     vi.doMock('fs/promises', () => makeFsMock(dbPath));
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: openLbugConnectionMock,
       closeLbugConnection: async (handle: {
@@ -381,6 +455,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -449,7 +526,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const fsMock = makeFsMock(dbPath);
 
     vi.doMock('fs/promises', () => fsMock);
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: openLbugConnectionMock,
       closeLbugConnection: async (handle: { conn: typeof readOnlyConn; db: typeof readOnlyDb }) => {
@@ -462,6 +539,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -503,7 +583,7 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
     const db = { close: vi.fn(async () => {}) };
 
     vi.doMock('fs/promises', () => makeFsMock(dbPath));
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: vi.fn(async () => ({ db, conn })),
       closeLbugConnection: vi.fn(async () => {}),
@@ -516,6 +596,9 @@ describe('doInitLbug WAL corruption guard — behavioural', () => {
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -553,7 +636,11 @@ const TINY_ORPHAN_WAL_BYTES_TEST = 4 * 1024;
  * `orphan-wal` vs `tiny-orphan-wal` branches of refuseLargeWalQuarantine
  * without spinning up real files.
  */
-function makeFsMockWithWalSize(dbPath: string, walBytes: number | 'missing') {
+function makeFsMockWithWalSize(
+  dbPath: string,
+  walBytes: number | 'missing',
+  shadowBytes: number | 'missing' = 'missing',
+) {
   const ENOENT = Object.assign(new Error(`ENOENT: ${dbPath}`), { code: 'ENOENT' });
   const isWal = (p: string): boolean => p === `${dbPath}.wal`;
   const isShadow = (p: string): boolean => p === `${dbPath}.shadow`;
@@ -564,6 +651,7 @@ function makeFsMockWithWalSize(dbPath: string, walBytes: number | 'missing') {
       }),
       access: vi.fn(async (p: string) => {
         if (isWal(p) && walBytes !== 'missing') return;
+        if (isShadow(p) && shadowBytes !== 'missing') return;
         throw ENOENT;
       }),
       stat: vi.fn(async (p: string) => {
@@ -571,13 +659,20 @@ function makeFsMockWithWalSize(dbPath: string, walBytes: number | 'missing') {
           if (walBytes === 'missing') throw ENOENT;
           return { size: walBytes };
         }
-        if (isShadow(p)) throw ENOENT;
+        if (isShadow(p)) {
+          if (shadowBytes === 'missing') throw ENOENT;
+          return { size: shadowBytes };
+        }
         return { size: 0 };
       }),
       unlink: vi.fn(async () => {}),
       rename: vi.fn(async () => {}),
       mkdir: vi.fn(async () => {}),
       open: makeOpenMock(),
+      readdir: vi.fn(async () => []),
+      readFile: vi.fn(async () => {
+        throw ENOENT;
+      }),
     },
   };
 }
@@ -588,9 +683,14 @@ describe('Symmetric WAL-size gate during missing-shadow recovery (PR #1747 D2)',
     vi.unstubAllEnvs();
   });
 
-  const setupShadowMissingRecovery = (dbPath: string, walBytes: number | 'missing') => {
+  const setupShadowMissingRecovery = (
+    dbPath: string,
+    walBytes: number | 'missing',
+    opts: { errorMessage?: string; shadowBytes?: number | 'missing' } = {},
+  ) => {
     const missingShadowError = new Error(
-      `IO exception: Cannot open file ${dbPath}.shadow: No such file or directory`,
+      opts.errorMessage ??
+        `IO exception: Cannot open file ${dbPath}.shadow: No such file or directory`,
     );
     const queryResult = { getAll: vi.fn(async () => []), close: vi.fn() };
     const firstConn = {
@@ -607,11 +707,11 @@ describe('Symmetric WAL-size gate during missing-shadow recovery (PR #1747 D2)',
       .fn()
       .mockResolvedValueOnce({ db: firstDb, conn: firstConn })
       .mockResolvedValueOnce({ db: recoveredDb, conn: recoveredConn });
-    const fsMock = makeFsMockWithWalSize(dbPath, walBytes);
+    const fsMock = makeFsMockWithWalSize(dbPath, walBytes, opts.shadowBytes ?? 'missing');
     const warnMock = vi.fn();
 
     vi.doMock('fs/promises', () => fsMock);
-    vi.doMock('../../src/core/lbug/schema.js', () => SCHEMA_MOCK);
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
     vi.doMock('../../src/core/lbug/lbug-config.js', () => ({
       openLbugConnection: openLbugConnectionMock,
       closeLbugConnection: async (handle: { conn: typeof firstConn; db: typeof firstDb }) => {
@@ -624,6 +724,9 @@ describe('Symmetric WAL-size gate during missing-shadow recovery (PR #1747 D2)',
       WAL_RECOVERY_SUGGESTION:
         'WAL corruption detected. Run `gitnexus analyze --force` to rebuild the index.',
       waitForWindowsHandleRelease: vi.fn(async () => true),
+      isStorageVersionMismatchError: vi.fn(() => false),
+      throwIfStorageVersionMismatch: vi.fn(),
+      STORAGE_VERSION_MISMATCH_SUGGESTION: '',
     }));
     vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
       extensionManager: {
@@ -712,5 +815,215 @@ describe('Symmetric WAL-size gate during missing-shadow recovery (PR #1747 D2)',
       expect.stringContaining(`${dbPath}.wal.missing-shadow.`),
     );
     await adapter.closeLbug();
+  });
+
+  // ─── Windows-format missing-shadow recovery (issue #2382) ─────────────────
+  //
+  // On Windows the native engine reports a missing shadow as
+  // `Cannot open file. path: <p>.shadow - Error 2: <localized text>`, not the
+  // POSIX `: No such file or directory`. Before the fix isMissingShadowSidecarError
+  // missed that form, so the read-only open on serve repo-switch rethrew the raw
+  // error as an HTTP 500 and never quarantined the orphan WAL — the repo stayed
+  // broken. These drive the SAME recovery path with the Windows string through
+  // both consumers (read-only + writable) and pin the present-shadow guard (KTD7).
+
+  const windowsError2 = (dbPath: string) =>
+    `IO exception: Cannot open file. path: ${dbPath}.shadow - Error 2: The system cannot find the file specified.`;
+
+  it('read-only: recognizes the Windows Error 2 form and self-heals a tiny orphan WAL', async () => {
+    vi.resetModules();
+    const dbPath = '/tmp/gitnexus-lbug-win-selfheal/lbug';
+    const { fsMock } = setupShadowMissingRecovery(dbPath, 1024, {
+      errorMessage: windowsError2(dbPath),
+    });
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+    await expect(adapter.withLbugDb(dbPath, async () => 'ok', { readOnly: true })).resolves.toBe(
+      'ok',
+    );
+    expect(fsMock.default.rename).toHaveBeenCalledWith(
+      `${dbPath}.wal`,
+      expect.stringContaining(`${dbPath}.wal.missing-shadow.`),
+    );
+    await adapter.closeLbug();
+  });
+
+  it('read-only: Windows Error 2 with a large WAL yields the actionable message (not the raw 500)', async () => {
+    vi.resetModules();
+    const dbPath = '/tmp/gitnexus-lbug-win-largewal/lbug';
+    const { fsMock } = setupShadowMissingRecovery(dbPath, TINY_ORPHAN_WAL_BYTES_TEST + 1, {
+      errorMessage: windowsError2(dbPath),
+    });
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+    await expect(
+      adapter.withLbugDb(dbPath, async () => 'unreached', { readOnly: true }),
+    ).rejects.toThrow(/LadybugDB checkpoint sidecar is missing/);
+    expect(fsMock.default.rename).not.toHaveBeenCalled();
+  });
+
+  it('writable: Windows Error 2 flows through the same guarded recovery (blast-radius R4)', async () => {
+    vi.resetModules();
+    const dbPath = '/tmp/gitnexus-lbug-win-writable/lbug';
+    const { fsMock } = setupShadowMissingRecovery(dbPath, 1024, {
+      errorMessage: windowsError2(dbPath),
+    });
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+    await expect(adapter.initLbug(dbPath)).resolves.toBeDefined();
+    expect(fsMock.default.rename).toHaveBeenCalledWith(
+      `${dbPath}.wal`,
+      expect.stringContaining(`${dbPath}.wal.missing-shadow.`),
+    );
+    await adapter.closeLbug();
+  });
+
+  it('KTD7 guard: refuses to quarantine when the shadow is present on disk (data-loss guard)', async () => {
+    vi.resetModules();
+    const dbPath = '/tmp/gitnexus-lbug-win-shadow-present/lbug';
+    const { fsMock, warnMock } = setupShadowMissingRecovery(dbPath, 1024, {
+      errorMessage: windowsError2(dbPath),
+      shadowBytes: 64,
+    });
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+
+    await expect(
+      adapter.withLbugDb(dbPath, async () => 'unreached', { readOnly: true }),
+      // Present-shadow refusal throws the present-but-unreachable message (S2),
+      // NOT the "sidecar is missing / rebuild" message — the shadow is present.
+    ).rejects.toThrow(/LadybugDB checkpoint sidecar is present but unreachable/);
+    expect(fsMock.default.rename).not.toHaveBeenCalled();
+    expect(warnMock).toHaveBeenCalledWith(
+      expect.stringContaining('the .shadow sidecar is present on disk'),
+    );
+  });
+});
+
+const NATIVE_STORAGE_VERSION_MISMATCH =
+  'Runtime exception: Trying to read a database file with a different version. Database file version: 43, Current build storage version: 42';
+
+describe('doInitLbug storage-version fail-fast — behavioural', () => {
+  afterEach(() => {
+    vi.doUnmock('fs/promises');
+    vi.doUnmock('../../src/core/lbug/schema.js');
+    vi.doUnmock('../../src/core/lbug/lbug-config.js');
+    vi.doUnmock('../../src/core/lbug/extension-loader.js');
+    vi.doUnmock('../../src/core/logger.js');
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('throws the rebuild hint when a writable schema query raises a storage-version mismatch', async () => {
+    vi.resetModules();
+
+    const dbPath = '/tmp/gitnexus-lbug-storage-version-schema/lbug';
+    const versionError = new Error(NATIVE_STORAGE_VERSION_MISMATCH);
+    const queryResult = { getAll: vi.fn(async () => []), close: vi.fn() };
+    const conn = {
+      query: vi.fn().mockRejectedValueOnce(versionError).mockResolvedValue(queryResult),
+      close: vi.fn(async () => {}),
+    };
+    const db = { close: vi.fn(async () => {}) };
+    const warnMock = vi.fn();
+
+    vi.doMock('fs/promises', () => makeFsMock(dbPath));
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
+    await mockLbugConfigForStorageVersion({
+      openLbugConnection: vi.fn(async () => ({ db, conn })),
+      closeLbugConnection: vi.fn(async () => {}),
+    });
+    vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
+      extensionManager: {
+        ensure: vi.fn(async () => true),
+        getCapabilities: vi.fn(() => []),
+        reset: vi.fn(),
+      },
+    }));
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { warn: warnMock, info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const err = await adapter.initLbug(dbPath).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain(STORAGE_VERSION_MISMATCH_SUGGESTION);
+    expect((err as Error).message).toMatch(/database file with a different version/i);
+    expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining('Schema creation warning'));
+    expect(db.close).toHaveBeenCalled();
+    // Schema DDL is not retried. A second query is the CHECKPOINT inside safeClose.
+    expect(conn.query).toHaveBeenNthCalledWith(1, SCHEMA_MOCK.SCHEMA_QUERIES[0]);
+    expect(
+      conn.query.mock.calls.filter((call) => call[0] === SCHEMA_MOCK.SCHEMA_QUERIES[0]),
+    ).toHaveLength(1);
+  });
+
+  it('throws the rebuild hint when writable openLbugConnection raises a storage-version mismatch', async () => {
+    vi.resetModules();
+
+    const dbPath = '/tmp/gitnexus-lbug-storage-version-writable-open/lbug';
+    const versionError = new Error(NATIVE_STORAGE_VERSION_MISMATCH);
+    const openLbugConnection = vi.fn(async () => {
+      throw versionError;
+    });
+    const warnMock = vi.fn();
+
+    vi.doMock('fs/promises', () => makeFsMock(dbPath));
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
+    await mockLbugConfigForStorageVersion({
+      openLbugConnection,
+      closeLbugConnection: vi.fn(async () => {}),
+    });
+    vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
+      extensionManager: {
+        ensure: vi.fn(async () => true),
+        getCapabilities: vi.fn(() => []),
+        reset: vi.fn(),
+      },
+    }));
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { warn: warnMock, info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await expect(adapter.initLbug(dbPath)).rejects.toThrow(STORAGE_VERSION_MISMATCH_SUGGESTION);
+    expect(openLbugConnection).toHaveBeenCalledTimes(1);
+    expect(warnMock).not.toHaveBeenCalledWith(expect.stringContaining('Schema creation warning'));
+  });
+
+  it('throws the rebuild hint on a read-only open storage-version mismatch without lock-retrying', async () => {
+    vi.resetModules();
+
+    const dbPath = '/tmp/gitnexus-lbug-storage-version-readonly/lbug';
+    const versionError = new Error(NATIVE_STORAGE_VERSION_MISMATCH);
+    const openLbugConnection = vi.fn(async () => {
+      throw versionError;
+    });
+
+    vi.doMock('fs/promises', () => makeFsMock(dbPath));
+    vi.doMock('../../src/core/lbug/schema.js', schemaMockFactory);
+    await mockLbugConfigForStorageVersion({
+      openLbugConnection,
+      closeLbugConnection: vi.fn(async () => {}),
+    });
+    vi.doMock('../../src/core/lbug/extension-loader.js', () => ({
+      extensionManager: {
+        ensure: vi.fn(async () => true),
+        getCapabilities: vi.fn(() => []),
+        reset: vi.fn(),
+      },
+    }));
+    vi.doMock('../../src/core/logger.js', () => ({
+      logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    }));
+
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await expect(
+      adapter.withLbugDb(dbPath, async () => 'unreached', { readOnly: true }),
+    ).rejects.toThrow(STORAGE_VERSION_MISMATCH_SUGGESTION);
+    expect(openLbugConnection).toHaveBeenCalledTimes(1);
   });
 });

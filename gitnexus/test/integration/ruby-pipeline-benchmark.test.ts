@@ -3,13 +3,14 @@
  *
  * Generates synthetic Ruby codebases at increasing scales and measures
  * wall-clock time and peak heap through the full pipeline — parsing,
- * scope extraction, heritage (include/extend/prepend), MRO construction,
- * and call resolution via the registry-primary scope-resolution path.
+ * scope extraction, manifest-scoped external require resolution, heritage
+ * (include/extend/prepend), MRO construction, and call resolution via the
+ * registry-primary scope-resolution path.
  *
  * Run: GITNEXUS_BENCH=1 npx vitest run test/integration/ruby-pipeline-benchmark.test.ts
  *
  * The benchmark uses workers (production path) by default. Set
- * skipWorkers to test the sequential fallback path.
+ * a single-worker pool (the sequential parser was removed).
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
@@ -38,6 +39,10 @@ function generateRubyFixture(
   modulesPerLevel: number,
 ): { dir: string; classCount: number; moduleCount: number; mixinModuleCount: number } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `ruby-bench-${fileCount}-`));
+  fs.writeFileSync(
+    path.join(dir, 'Gemfile'),
+    ["source 'https://rubygems.org'", "gem 'rails'"].join('\n'),
+  );
 
   // Three families of mixins: one for include, one for extend, one for prepend.
   // Each family has modulesPerLevel² modules so the MRO partitioning logic is
@@ -120,6 +125,7 @@ function generateRubyFixture(
     const crossClass = `Model${crossIdx}`;
 
     const requireLines = [
+      `require 'rails/generators'`,
       `require_relative '../concerns/${incMixin.toLowerCase()}'`,
       `require_relative '../concerns/${incMixin2.toLowerCase()}'`,
       `require_relative '../concerns/${extMixin.toLowerCase()}'`,

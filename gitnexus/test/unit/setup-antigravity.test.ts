@@ -20,10 +20,10 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
-import { createRequire } from 'module';
+import { commitAll, initGitRepo } from '../helpers/temp-git-repo.js';
+import { packageVersion } from '../../src/core/package-version.js';
 
-const PKG_VERSION = (createRequire(import.meta.url)('../../package.json') as { version: string })
-  .version;
+const PKG_VERSION = packageVersion();
 const NPX_REF = `gitnexus@${PKG_VERSION}`;
 
 // vi.hoisted lets the mock factory below (which is hoisted by Vitest) see
@@ -61,6 +61,11 @@ describe('setupAntigravity', () => {
       value,
       configurable: true,
     });
+  };
+
+  const restoreSkillsRoot = (previous: string | undefined) => {
+    if (previous === undefined) delete process.env.GITNEXUS_TEST_SKILLS_ROOT;
+    else process.env.GITNEXUS_TEST_SKILLS_ROOT = previous;
   };
 
   beforeEach(async () => {
@@ -246,6 +251,10 @@ describe('setupAntigravity', () => {
     // Required by hook-db-lock-probe.cjs on Windows; without it the MCP
     // server ownership probe silently fails open.
     await expect(fs.access(path.join(destDir, 'win-rm-list-json.ps1'))).resolves.toBeUndefined();
+    // The adapter top-level require()s this; the production install path must
+    // co-locate it next to the adapter (symmetric with the Claude install).
+    await expect(fs.access(path.join(destDir, 'resolve-analyze-cmd.cjs'))).resolves.toBeUndefined();
+    await expect(fs.access(path.join(destDir, 'registry-query.cjs'))).resolves.toBeUndefined();
   });
 
   it('installs skills under ~/.gemini/antigravity/skills/<name>/SKILL.md', async () => {
@@ -259,6 +268,7 @@ describe('setupAntigravity', () => {
       '---\nname: gitnexus-test\ndescription: fixture\n---\nbody\n',
       'utf-8',
     );
+    const originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
     process.env.GITNEXUS_TEST_SKILLS_ROOT = fixtureSkillsRoot;
 
     try {
@@ -274,7 +284,117 @@ describe('setupAntigravity', () => {
         fs.access(path.join(skillsDir, 'gitnexus-test', 'SKILL.md')),
       ).resolves.toBeUndefined();
     } finally {
-      delete process.env.GITNEXUS_TEST_SKILLS_ROOT;
+      restoreSkillsRoot(originalSkillsRoot);
+    }
+  });
+
+  it('preserves a customized installed skill when setup is rerun', async () => {
+    const fixtureSkillsRoot = path.join(tempHome, 'fixture-skills');
+    const installedSkill = path.join(
+      tempHome,
+      '.gemini',
+      'antigravity',
+      'skills',
+      'gitnexus-test',
+      'SKILL.md',
+    );
+    await fs.mkdir(fixtureSkillsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(fixtureSkillsRoot, 'gitnexus-test.md'),
+      '---\nname: gitnexus-test\ndescription: fixture\n---\nbody\n',
+      'utf-8',
+    );
+    const originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
+    process.env.GITNEXUS_TEST_SKILLS_ROOT = fixtureSkillsRoot;
+
+    try {
+      const { setupCommand } = await import('../../src/cli/setup.js');
+      await setupCommand();
+      await fs.writeFile(installedSkill, 'customized by operator\n', 'utf-8');
+
+      await setupCommand();
+
+      await expect(fs.readFile(installedSkill, 'utf-8')).resolves.toBe('customized by operator\n');
+    } finally {
+      restoreSkillsRoot(originalSkillsRoot);
+    }
+  });
+
+  it('preserves customized files inside a directory skill when SKILL.md still matches', async () => {
+    const fixtureSkillsRoot = path.join(tempHome, 'fixture-skills');
+    const skillDir = path.join(tempHome, '.gemini', 'antigravity', 'skills', 'gitnexus-test');
+    const referencePath = path.join(skillDir, 'references', 'note.md');
+    await fs.mkdir(path.join(fixtureSkillsRoot, 'gitnexus-test', 'references'), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(fixtureSkillsRoot, 'gitnexus-test', 'SKILL.md'),
+      '---\nname: gitnexus-test\ndescription: fixture\n---\nbody\n',
+      'utf-8',
+    );
+    await fs.writeFile(
+      path.join(fixtureSkillsRoot, 'gitnexus-test', 'references', 'note.md'),
+      'bundled note\n',
+      'utf-8',
+    );
+    const originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
+    process.env.GITNEXUS_TEST_SKILLS_ROOT = fixtureSkillsRoot;
+
+    try {
+      const { setupCommand } = await import('../../src/cli/setup.js');
+      await setupCommand();
+      await fs.writeFile(referencePath, 'operator note\n', 'utf-8');
+
+      await setupCommand();
+
+      await expect(fs.readFile(referencePath, 'utf-8')).resolves.toBe('operator note\n');
+      await expect(fs.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8')).resolves.toBe(
+        '---\nname: gitnexus-test\ndescription: fixture\n---\nbody\n',
+      );
+    } finally {
+      restoreSkillsRoot(originalSkillsRoot);
+    }
+  });
+
+  it('copies new bundled companions even when SKILL.md was customized', async () => {
+    const fixtureSkillsRoot = path.join(tempHome, 'fixture-skills');
+    const skillDir = path.join(tempHome, '.gemini', 'antigravity', 'skills', 'gitnexus-test');
+    await fs.mkdir(path.join(fixtureSkillsRoot, 'gitnexus-test', 'references'), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(fixtureSkillsRoot, 'gitnexus-test', 'SKILL.md'),
+      '---\nname: gitnexus-test\ndescription: fixture\n---\nbody\n',
+      'utf-8',
+    );
+    await fs.writeFile(
+      path.join(fixtureSkillsRoot, 'gitnexus-test', 'references', 'note.md'),
+      'bundled note\n',
+      'utf-8',
+    );
+    const originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
+    process.env.GITNEXUS_TEST_SKILLS_ROOT = fixtureSkillsRoot;
+
+    try {
+      const { setupCommand } = await import('../../src/cli/setup.js');
+      await setupCommand();
+      await fs.writeFile(path.join(skillDir, 'SKILL.md'), 'customized by operator\n', 'utf-8');
+      await fs.writeFile(
+        path.join(fixtureSkillsRoot, 'gitnexus-test', 'references', 'added.md'),
+        'new bundled companion\n',
+        'utf-8',
+      );
+
+      await setupCommand();
+
+      await expect(fs.readFile(path.join(skillDir, 'SKILL.md'), 'utf-8')).resolves.toBe(
+        'customized by operator\n',
+      );
+      await expect(
+        fs.readFile(path.join(skillDir, 'references', 'added.md'), 'utf-8'),
+      ).resolves.toBe('new bundled companion\n');
+    } finally {
+      restoreSkillsRoot(originalSkillsRoot);
     }
   });
 });
@@ -294,6 +414,8 @@ const ADAPTER_SRC = path.join(
 const LOCK_SRC = path.join(PROJECT_ROOT, 'hooks', 'claude', 'hook-lock.cjs');
 const PROBE_SRC = path.join(PROJECT_ROOT, 'hooks', 'claude', 'hook-db-lock-probe.cjs');
 const WIN_RM_SRC = path.join(PROJECT_ROOT, 'hooks', 'claude', 'win-rm-list-json.ps1');
+const RESOLVE_SRC = path.join(PROJECT_ROOT, 'hooks', 'claude', 'resolve-analyze-cmd.cjs');
+const REGISTRY_QUERY_SRC = path.join(PROJECT_ROOT, 'hooks', 'claude', 'registry-query.cjs');
 
 async function stageAdapter(): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-antigravity-adapter-'));
@@ -304,6 +426,10 @@ async function stageAdapter(): Promise<string> {
   // the lock probe silently fails open and the adapter's Windows DB-lock path
   // would be untested in child-process smoke tests.
   await fs.copyFile(WIN_RM_SRC, path.join(tmp, 'win-rm-list-json.ps1'));
+  // The adapter top-level `require('./resolve-analyze-cmd.cjs')`s this helper;
+  // without staging it the spawned adapter crashes with MODULE_NOT_FOUND.
+  await fs.copyFile(RESOLVE_SRC, path.join(tmp, 'resolve-analyze-cmd.cjs'));
+  await fs.copyFile(REGISTRY_QUERY_SRC, path.join(tmp, 'registry-query.cjs'));
   return path.join(tmp, 'gitnexus-antigravity-hook.cjs');
 }
 
@@ -311,33 +437,55 @@ function runAdapter(
   hookPath: string,
   input: Record<string, any>,
   cwd?: string,
+  env?: Record<string, string>,
 ): { stdout: string; stderr: string; status: number | null } {
   const result = spawnSync(process.execPath, [hookPath], {
     input: JSON.stringify(input),
     encoding: 'utf-8',
     timeout: 10000,
     cwd,
+    env: env ? { ...process.env, ...env } : process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   return { stdout: result.stdout || '', stderr: result.stderr || '', status: result.status };
 }
 
+// A staged adapter that fails to load (e.g. a missing sibling helper) exits
+// non-zero and prints MODULE_NOT_FOUND — a state that otherwise masquerades as
+// "no stdout" in the silent-path tests below. Assert the process actually ran.
+function expectAdapterLoaded(stderr: string, status: number | null): void {
+  expect(status).toBe(0);
+  expect(stderr).not.toMatch(/MODULE_NOT_FOUND|Cannot find module/);
+}
+
 describe('gitnexus-antigravity-hook adapter', () => {
   let adapter: string;
   let workdir: string;
+  let registryHome: string;
 
   beforeEach(async () => {
     adapter = await stageAdapter();
     workdir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-antigravity-work-'));
+    registryHome = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-antigravity-registry-'));
+    await fs.writeFile(path.join(registryHome, 'registry.json'), '[]\n', 'utf-8');
   });
 
   afterEach(async () => {
     await fs.rm(path.dirname(adapter), { recursive: true, force: true });
     await fs.rm(workdir, { recursive: true, force: true });
+    await fs.rm(registryHome, { recursive: true, force: true });
   });
 
+  async function registerWorkdir(storagePath: string): Promise<void> {
+    await fs.writeFile(
+      path.join(registryHome, 'registry.json'),
+      JSON.stringify([{ name: 'adapter-test', path: workdir, storagePath }]),
+      'utf-8',
+    );
+  }
+
   it('AfterTool with no .gitnexus/ produces no stdout', async () => {
-    const { stdout } = runAdapter(
+    const { stdout, stderr, status } = runAdapter(
       adapter,
       {
         hook_event_name: 'AfterTool',
@@ -349,10 +497,11 @@ describe('gitnexus-antigravity-hook adapter', () => {
       workdir,
     );
     expect(stdout.trim()).toBe('');
+    expectAdapterLoaded(stderr, status);
   });
 
   it('AfterTool ignores unrelated tools silently', async () => {
-    const { stdout, stderr } = runAdapter(
+    const { stdout, stderr, status } = runAdapter(
       adapter,
       {
         hook_event_name: 'AfterTool',
@@ -365,6 +514,7 @@ describe('gitnexus-antigravity-hook adapter', () => {
     );
     expect(stdout.trim()).toBe('');
     expect(stderr).not.toMatch(/\[GitNexus\]/);
+    expectAdapterLoaded(stderr, status);
   });
 
   it('AfterTool ignores non-git run_shell_command silently', async () => {
@@ -376,7 +526,7 @@ describe('gitnexus-antigravity-hook adapter', () => {
       'utf-8',
     );
 
-    const { stdout, stderr } = runAdapter(
+    const { stdout, stderr, status } = runAdapter(
       adapter,
       {
         hook_event_name: 'AfterTool',
@@ -389,16 +539,14 @@ describe('gitnexus-antigravity-hook adapter', () => {
     );
     expect(stdout.trim()).toBe('');
     expect(stderr).not.toMatch(/\[GitNexus\]/);
+    expectAdapterLoaded(stderr, status);
   });
 
   it('AfterTool emits stale-index hint after a successful git commit', async () => {
     // Initialize a git repo and a stale .gitnexus/meta.json.
-    spawnSync('git', ['init', '-q'], { cwd: workdir });
-    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workdir });
-    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: workdir });
+    initGitRepo(workdir);
     await fs.writeFile(path.join(workdir, 'a.txt'), 'hello', 'utf-8');
-    spawnSync('git', ['add', '.'], { cwd: workdir });
-    spawnSync('git', ['commit', '-q', '-m', 'init'], { cwd: workdir });
+    commitAll(workdir, 'init');
 
     const gnDir = path.join(workdir, '.gitnexus');
     await fs.mkdir(gnDir, { recursive: true });
@@ -407,26 +555,40 @@ describe('gitnexus-antigravity-hook adapter', () => {
       JSON.stringify({ lastCommit: '0000000000000000000000000000000000000000', stats: {} }),
       'utf-8',
     );
+    await registerWorkdir(gnDir);
 
-    const { stdout, stderr } = runAdapter(
-      adapter,
-      {
-        hook_event_name: 'AfterTool',
-        tool_name: 'run_shell_command',
-        tool_input: { command: 'git commit -m "x"' },
-        tool_response: { llmContent: '[committed]' },
-        cwd: workdir,
-      },
-      workdir,
-    );
+    const input = {
+      hook_event_name: 'AfterTool',
+      tool_name: 'run_shell_command',
+      tool_input: { command: 'git commit -m "x"' },
+      tool_response: { llmContent: '[committed]' },
+      cwd: workdir,
+    };
+    // Force a deterministic invocation mode: the emitted analyze command varies
+    // by what's installed on each CI runner (gitnexus/pnpm/npx); only the
+    // `gitnexus` mode yields the bare `gitnexus analyze` form.
+    const { stdout, stderr } = runAdapter(adapter, input, workdir, {
+      GITNEXUS_INVOCATION: 'gitnexus',
+      GITNEXUS_DEBUG: '',
+      GITNEXUS_HOME: registryHome,
+    });
 
-    // Hint surfaces both via the agent-visible channel and stderr (terminal).
-    expect(stderr).toMatch(/\[GitNexus\] index is stale/);
-    expect(stderr).toMatch(/gitnexus analyze/);
-
+    // #1913: by default the hint reaches the agent via additionalContext (stdout
+    // JSON) but is NOT mirrored to stderr, so strict hook runners stay clean.
     const parsed = JSON.parse(stdout);
     expect(parsed.hookSpecificOutput.hookEventName).toBe('AfterTool');
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/index is stale/);
+    expect(parsed.hookSpecificOutput.additionalContext).toMatch(/gitnexus analyze/);
+    expect(stderr).not.toMatch(/\[GitNexus\] index is stale/);
+
+    // The terminal mirror remains available under GITNEXUS_DEBUG=1.
+    const debug = runAdapter(adapter, input, workdir, {
+      GITNEXUS_INVOCATION: 'gitnexus',
+      GITNEXUS_DEBUG: '1',
+      GITNEXUS_HOME: registryHome,
+    });
+    expect(debug.stderr).toMatch(/\[GitNexus\] index is stale/);
+    expect(debug.stderr).toMatch(/gitnexus analyze/);
   });
 
   it('AfterTool skips augment when the tool failed', async () => {
@@ -438,7 +600,7 @@ describe('gitnexus-antigravity-hook adapter', () => {
       'utf-8',
     );
 
-    const { stdout } = runAdapter(
+    const { stdout, stderr, status } = runAdapter(
       adapter,
       {
         hook_event_name: 'AfterTool',
@@ -450,6 +612,7 @@ describe('gitnexus-antigravity-hook adapter', () => {
       workdir,
     );
     expect(stdout.trim()).toBe('');
+    expectAdapterLoaded(stderr, status);
   });
 
   it('ignores unknown tool names without crashing', async () => {

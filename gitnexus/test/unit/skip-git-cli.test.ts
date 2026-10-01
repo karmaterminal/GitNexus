@@ -39,11 +39,18 @@ describe('--skip-git CLI flag', () => {
       cwd: path.resolve(__dirname, '../..'),
       encoding: 'utf8',
       timeout: 10000,
+      env: { ...process.env, GITNEXUS_LANG: 'en' },
     });
 
     expect(helpOutput).toContain('--skip-git');
-    expect(helpOutput).toContain('--skip-agents-md');
-    expect(helpOutput).toContain('--skip-skills');
+    const helpFlat = helpOutput.replace(/\s+/g, ' ');
+    expect(helpFlat).toContain('--skip-agents-md');
+    expect(helpFlat).toContain('Does not skip standard skills in .claude/skills');
+    expect(helpFlat).toContain('Community skills from --skills are unaffected');
+    expect(helpFlat).toContain('--skip-skills');
+    expect(helpOutput).toContain('directly under .claude/skills/');
+    expect(helpOutput).toContain('.agents/skills/');
+    expect(helpOutput).toContain('.claude/skills/gitnexus-area-*');
     expect(helpOutput).toContain('--index-only');
     expect(helpOutput).not.toContain('--no-git');
   });
@@ -63,6 +70,10 @@ describe('--skip-git CLI flag', () => {
       ...process.env,
       HOME: gitnexusHome,
       GITNEXUS_HOME: gitnexusHome,
+      // This suite tests repository-root selection, not extension installation.
+      // Keep child CLI runs offline so an unavailable FTS download cannot consume
+      // Vitest's per-test timeout.
+      GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
     };
 
     try {
@@ -125,6 +136,7 @@ describe('--skip-git CLI flag', () => {
       ...process.env,
       HOME: gitnexusHome,
       GITNEXUS_HOME: gitnexusHome,
+      GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
     };
 
     try {
@@ -156,14 +168,25 @@ describe('--skip-git CLI flag', () => {
       expect(keepContext).toContain('"status": "found"');
       expect(keepContext).toContain('"filePath": "src/keep.ts"');
 
-      const leakedContext = execSync(
-        `node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`,
-        {
-          encoding: 'utf8',
-          timeout: 60000,
-          env,
-        },
-      );
+      // Since #2470 a backend error payload also exits non-zero, so capture
+      // the payload from the exec failure instead of expecting exit 0.
+      let leakedContext = '';
+      let leakedStatus = 0;
+      try {
+        leakedContext = execSync(
+          `node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`,
+          {
+            encoding: 'utf8',
+            timeout: 60000,
+            env,
+          },
+        );
+      } catch (err: unknown) {
+        const execErr = err as { status?: number; stdout?: string | Buffer };
+        leakedStatus = execErr.status ?? 0;
+        leakedContext = String(execErr.stdout ?? '');
+      }
+      expect(leakedStatus).toBe(1);
       expect(leakedContext).toContain(`"error": "Symbol 'leaked' not found"`);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -180,6 +203,7 @@ describe('--skip-git CLI flag', () => {
         ...process.env,
         HOME: gitnexusHome,
         GITNEXUS_HOME: gitnexusHome,
+        GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
       };
     }
 

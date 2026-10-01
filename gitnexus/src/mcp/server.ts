@@ -7,12 +7,12 @@
  *
  * Supports multiple indexed repositories via the global registry.
  *
- * Tools: list_repos, query, cypher, context, impact, detect_changes, rename
+ * Tools: list_repos, query, cypher, context, read_file, grep, impact, detect_changes, rename
  * Resources: repos, repo/{name}/context, repo/{name}/clusters, ...
  */
 
-import { createRequire } from 'module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { packageVersion } from '../core/package-version.js';
 import { CompatibleStdioServerTransport } from './compatible-stdio-transport.js';
 import {
   CallToolRequestSchema,
@@ -23,10 +23,26 @@ import {
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { GITNEXUS_TOOLS } from './tools.js';
+import { GITNEXUS_TOOLS, REPO_SCOPED_TOOLS } from './tools.js';
 import { installGlobalStdoutSentinel } from './stdio-context.js';
 import type { LocalBackend } from './local/local-backend.js';
 import { getResourceDefinitions, getResourceTemplates, readResource } from './resources.js';
+import {
+  assertMcpReadOnlyResource,
+  assertMcpReadOnlyToolCall,
+  filterMcpReadOnlyResourceContent,
+  MCP_READ_ONLY_TOOLS,
+  readOnlyResourceTemplateAllowed,
+  resolveMcpReadOnlyMode,
+  toolForReadOnlyMcp,
+} from './read-only-policy.js';
+import {
+  createMcpRepositoryPolicy,
+  McpRepositoryPolicy,
+  mcpRepositoryPolicyConfigured,
+} from './repository-policy.js';
+import { applyMcpMaxTokens, resolveMcpMaxTokens, withoutMcpBudgetArg } from './output-budget.js';
+import { assertKnownMcpToolArguments, schemaSourceToolName } from './tool-arguments.js';
 
 /**
  * Next-step hints appended to tool responses.
@@ -44,10 +60,10 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
 
   switch (toolName) {
     case 'list_repos':
-      return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness.`;
+      return `\n\n---\n**Next:** READ gitnexus://repo/{name}/context for any repo above to get its overview and check staleness. If pagination.hasMore is true, call list_repos again with offset set to pagination.nextOffset to fetch the rest.`;
 
     case 'query':
-      return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.`;
+      return `\n\n---\n**Next:** To understand a specific symbol in depth, use context({name: "<symbol_name>"${repoParam}}) to see categorized refs and process participation.${args?.include_content === true ? ` For source of a process_symbols row without content, use context({uid: "<id>", include_content: true${repoParam}}).` : ''}`;
 
     case 'context':
       return `\n\n---\n**Next:** If planning changes, use impact({target: "${args?.name || '<name>'}", direction: "upstream"${repoParam}}) to check blast radius. To see execution flows, READ gitnexus://repo/${repoPath}/processes.`;
@@ -64,6 +80,11 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
     case 'cypher':
       return `\n\n---\n**Next:** To explore a result symbol, use context({name: "<name>"${repoParam}}). For schema reference, READ gitnexus://repo/${repoPath}/schema.`;
 
+    case 'read_file':
+      return `\n\n---\n**Next:** To pin a symbol seen in the file, use context({name: "<symbol>"${repoParam}}). To find other occurrences, use grep({pattern: "<token>"${repoParam}}).`;
+
+    case 'grep':
+      return `\n\n---\n**Next:** Read the hit window with read_file({path: "<file>"${repoParam}, startLine: <hit.line - 1>, endLine: <hit.line - 1>}). Grep line is 1-based; read_file is 0-based. Or pin the symbol with context({name: "<symbol>"${repoParam}}).`;
     // Legacy tool names — still return useful hints
     case 'search':
       return `\n\n---\n**Next:** To understand a result in context, use context({name: "<symbol_name>"${repoParam}}).`;
@@ -77,17 +98,34 @@ function getNextStepHint(toolName: string, args: Record<string, any> | undefined
   }
 }
 
+/** Include a string `Error.code` in MCP error text when present. */
+function formatMcpToolError(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Unknown error';
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code: unknown }).code
+      : undefined;
+  return typeof code === 'string' ? `Error [${code}]: ${message}` : `Error: ${message}`;
+}
+
 /**
  * Create a configured MCP Server with all handlers registered.
  * Transport-agnostic — caller connects the desired transport.
  */
-export function createMCPServer(backend: LocalBackend): Server {
-  const require = createRequire(import.meta.url);
-  const pkgVersion: string = require('../../package.json').version;
+export function createMCPServer(
+  backend: LocalBackend,
+  options: { repositoryPolicy?: McpRepositoryPolicy } = {},
+): Server {
+  const readOnly = resolveMcpReadOnlyMode();
+  if (!options.repositoryPolicy && mcpRepositoryPolicyConfigured()) {
+    throw new Error('Configured MCP repository policy must be validated before server creation.');
+  }
+  const repositoryPolicy = options.repositoryPolicy ?? McpRepositoryPolicy.unrestricted();
+  const scopedBackend = repositoryPolicy.scopeBackend(backend);
   const server = new Server(
     {
       name: 'gitnexus',
-      version: pkgVersion,
+      version: packageVersion(),
     },
     {
       capabilities: {
@@ -113,7 +151,11 @@ export function createMCPServer(backend: LocalBackend): Server {
 
   // Handle list resource templates request (for dynamic resources)
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    const templates = getResourceTemplates();
+    const templates = getResourceTemplates().filter(
+      (template) =>
+        readOnlyResourceTemplateAllowed(template.uriTemplate, readOnly) &&
+        repositoryPolicy.resourceTemplateAllowed(template.uriTemplate),
+    );
     return {
       resourceTemplates: templates.map((t) => ({
         uriTemplate: t.uriTemplate,
@@ -129,7 +171,12 @@ export function createMCPServer(backend: LocalBackend): Server {
     const { uri } = request.params;
 
     try {
-      const content = await readResource(uri, backend);
+      assertMcpReadOnlyResource(uri, readOnly);
+      repositoryPolicy.assertResourceUri(uri);
+      const content = filterMcpReadOnlyResourceContent(
+        await readResource(uri, scopedBackend),
+        readOnly,
+      );
       return {
         contents: [
           {
@@ -139,35 +186,64 @@ export function createMCPServer(backend: LocalBackend): Server {
           },
         ],
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
       return {
         contents: [
           {
             uri,
             mimeType: 'text/plain',
-            text: `Error: ${err.message}`,
+            text: formatMcpToolError(err),
           },
         ],
       };
     }
   });
 
-  // Handle list tools request
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: GITNEXUS_TOOLS.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-      annotations: tool.annotations,
-    })),
-  }));
+  // Make the effective routing contract machine-readable. Read-only tools may
+  // use a cwd-derived default; mutating rename remains explicit unless policy
+  // supplies a single/default repository.
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const { readOnlyRequiresRepo, mutatingRequiresRepo } =
+      await repositoryPolicy.toolSchemaRepoRequirements(backend);
+    return {
+      tools: GITNEXUS_TOOLS.filter(
+        (tool) =>
+          (!readOnly || MCP_READ_ONLY_TOOLS.has(tool.name)) &&
+          repositoryPolicy.toolAllowed(tool.name),
+      )
+        .map((tool) => toolForReadOnlyMcp(repositoryPolicy.toolForMcp(tool), readOnly))
+        .map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema:
+            (tool.name === 'rename' ? mutatingRequiresRepo : readOnlyRequiresRepo) &&
+            REPO_SCOPED_TOOLS.has(tool.name)
+              ? {
+                  ...tool.inputSchema,
+                  required: [...new Set([...tool.inputSchema.required, 'repo'])],
+                }
+              : tool.inputSchema,
+          annotations: tool.annotations,
+        })),
+    };
+  });
 
   // Handle tool calls — append next-step hints to guide agent workflow
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    let maxTokens: number | undefined;
 
     try {
-      const result = await backend.callTool(name, args);
+      const typedArgs = args as Record<string, unknown> | undefined;
+      assertMcpReadOnlyToolCall(name, typedArgs, readOnly);
+      const schemaSource = schemaSourceToolName(name);
+      const advertisedTool = GITNEXUS_TOOLS.find((tool) => tool.name === schemaSource);
+      if (advertisedTool) {
+        const listed = toolForReadOnlyMcp(repositoryPolicy.toolForMcp(advertisedTool), readOnly);
+        assertKnownMcpToolArguments(name, typedArgs, listed.inputSchema.properties);
+      }
+      maxTokens = resolveMcpMaxTokens(name, typedArgs);
+      const result = await scopedBackend.callTool(name, withoutMcpBudgetArg(typedArgs));
       const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
       const hint = getNextStepHint(name, args as Record<string, any> | undefined);
 
@@ -175,17 +251,16 @@ export function createMCPServer(backend: LocalBackend): Server {
         content: [
           {
             type: 'text',
-            text: resultText + hint,
+            text: applyMcpMaxTokens(resultText + hint, maxTokens),
           },
         ],
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         content: [
           {
             type: 'text',
-            text: `Error: ${message}`,
+            text: applyMcpMaxTokens(formatMcpToolError(error), maxTokens),
           },
         ],
         isError: true,
@@ -284,8 +359,43 @@ Follow these steps:
 /**
  * Start the MCP server on stdio transport (for CLI use).
  */
-export async function startMCPServer(backend: LocalBackend): Promise<void> {
-  const server = createMCPServer(backend);
+/** Force-exit fallback budget if graceful shutdown cleanup hangs. */
+const SHUTDOWN_FORCE_EXIT_MS = 5_000;
+
+/** Conventional 128 + signal-number exit codes for graceful termination. */
+export const SHUTDOWN_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
+type SignalRegistrar = (
+  event: 'SIGINT' | 'SIGTERM',
+  listener: (...args: unknown[]) => void,
+) => void;
+
+/**
+ * Wire SIGINT/SIGTERM to a graceful shutdown using NUMERIC exit codes.
+ *
+ * Node invokes signal listeners with the signal NAME string as the first
+ * argument, so registering an `(exitCode = 0) => process.exit(exitCode)`
+ * shutdown directly passes `'SIGTERM'` into `process.exit()` and crashes with
+ * `ERR_INVALID_ARG_TYPE` (#1132). These wrappers discard the signal argument
+ * and pass the conventional 128+signal code instead. `on` is injectable so the
+ * mapping can be unit-tested without touching the real process.
+ */
+export function installSignalShutdown(
+  shutdown: (exitCode?: number) => unknown,
+  on: SignalRegistrar = (event, listener) => {
+    process.on(event, listener);
+  },
+): void {
+  on('SIGINT', () => void shutdown(SHUTDOWN_EXIT_CODES.SIGINT));
+  on('SIGTERM', () => void shutdown(SHUTDOWN_EXIT_CODES.SIGTERM));
+}
+
+export async function startMCPServer(
+  backend: LocalBackend,
+  repositoryPolicy?: McpRepositoryPolicy,
+): Promise<void> {
+  const validatedRepositoryPolicy = repositoryPolicy ?? (await createMcpRepositoryPolicy(backend));
+  const server = createMCPServer(backend, { repositoryPolicy: validatedRepositoryPolicy });
 
   // Idempotent global sentinel install. cli/mcp.ts calls this first thing
   // (before warnMissingOptionalGrammars / backend.init can emit to stdout);
@@ -306,7 +416,6 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     },
   });
   const transport = new CompatibleStdioServerTransport(process.stdin, safeStdout);
-  await server.connect(transport);
 
   // Surface the redirect counter on shutdown so users see the volume of
   // stray writes even when individual payloads were truncated/suppressed.
@@ -321,6 +430,11 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Safety net: if backend.disconnect()/server.close() hangs, still exit so a
+    // SIGINT/SIGTERM reliably terminates the process. Unref'd so the timer alone
+    // never keeps the event loop alive.
+    const forceExit = setTimeout(() => process.exit(exitCode), SHUTDOWN_FORCE_EXIT_MS);
+    forceExit.unref();
     try {
       await backend.disconnect();
     } catch {}
@@ -329,12 +443,16 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
     } catch {}
     const { flushLoggerSync } = await import('../core/logger.js');
     flushLoggerSync();
+    clearTimeout(forceExit);
     process.exit(exitCode);
   };
 
-  // Handle graceful shutdown
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  // Handle graceful shutdown. Node invokes signal listeners with the signal
+  // NAME (e.g. 'SIGTERM') as the first argument; registering `shutdown`
+  // directly passed that string to process.exit() and crashed with
+  // ERR_INVALID_ARG_TYPE (#1132). Map each signal to its conventional
+  // 128+signal exit code instead.
+  installSignalShutdown(shutdown);
 
   // Log crashes to stderr so they aren't silently lost.
   // uncaughtException is fatal — shut down.
@@ -342,14 +460,27 @@ export async function startMCPServer(backend: LocalBackend): Promise<void> {
   // killing the server for one missed catch would be worse than logging it.
   process.on('uncaughtException', (err) => {
     process.stderr.write(`GitNexus MCP uncaughtException: ${err?.stack || err}\n`);
-    shutdown(1);
+    void shutdown(1);
   });
   process.on('unhandledRejection', (reason: any) => {
     process.stderr.write(`GitNexus MCP unhandledRejection: ${reason?.stack || reason}\n`);
   });
 
-  // Handle stdio errors — stdin close means the parent process is gone
-  process.stdin.on('end', shutdown);
-  process.stdin.on('error', () => shutdown());
-  process.stdout.on('error', () => shutdown());
+  // Handle stdio errors — stdin close means the parent process is gone.
+  // Defense-in-depth: the transport also listens for stdin end/close and
+  // handles transport-level cleanup. These listeners handle process-level
+  // shutdown. Both paths are idempotent and safe to fire together.
+  // Wrap so the event payload (e.g. an Error for 'error') can never reach
+  // process.exit() as a non-numeric exit code, and void the returned promise.
+  process.stdin.on('end', () => void shutdown(0));
+  process.stdin.on('close', () => void shutdown(0));
+  process.stdin.on('error', () => void shutdown(0));
+  process.stdout.on('error', () => void shutdown(0));
+
+  if (process.stdin.readableEnded || process.stdin.destroyed) {
+    await shutdown(0);
+    return;
+  }
+
+  await server.connect(transport);
 }

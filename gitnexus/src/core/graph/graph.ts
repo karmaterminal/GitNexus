@@ -162,6 +162,19 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
     forEachRelationship(fn: (rel: GraphRelationship) => void) {
       relationshipMap.forEach(fn);
     },
+    forEachRelationshipFields(
+      fn: (
+        sourceId: string,
+        targetId: string,
+        type: RelationshipType,
+        confidence: number,
+        reason: string,
+      ) => void,
+    ) {
+      relationshipMap.forEach((rel) =>
+        fn(rel.sourceId, rel.targetId, rel.type, rel.confidence, rel.reason),
+      );
+    },
     getNode: (id: string) => nodeMap.get(id),
 
     // O(1) count getters - avoid creating arrays just for length

@@ -7,6 +7,7 @@
  *   - Pattern shorter than 3 chars returns empty string
  */
 import { describe, it, expect, vi } from 'vitest';
+import path from 'path';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 
 // ─── Seed data & FTS indexes for augmentation ────────
@@ -55,6 +56,16 @@ const AUGMENT_FTS_INDEXES = [
 vi.mock('../../src/storage/repo-manager.js', () => ({
   listRegisteredRepos: vi.fn(),
 }));
+
+vi.mock('../../src/storage/storage-resolver.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/storage/storage-resolver.js')>();
+  return {
+    ...actual,
+    requireRegisteredStoragePath: vi.fn(
+      async (entry: { storagePath: string }) => entry.storagePath,
+    ),
+  };
+});
 
 let augment: (pattern: string, cwd?: string) => Promise<string>;
 let augmentNoFts: (pattern: string, cwd?: string) => Promise<string>;
@@ -108,6 +119,17 @@ withTestLbugDB(
         expect(typeof result).toBe('string');
       });
 
+      it('silently degrades when the registered storage path fails validation', async () => {
+        const { requireRegisteredStoragePath } =
+          await import('../../src/storage/storage-resolver.js');
+        const resolverMock = vi.mocked(requireRegisteredStoragePath);
+        resolverMock.mockRejectedValueOnce(new Error('foreign storage'));
+
+        const result = await augment('login', handle.dbPath);
+
+        expect(result).toBe('');
+      });
+
       // ─── Negative-safety: fallback must stay gated on !ftsAvailable ───
       //
       // When FTS is available but happens to return zero BM25 hits, the
@@ -127,6 +149,131 @@ withTestLbugDB(
           expect(result).toBe('');
         } finally {
           spy.mockRestore();
+        }
+      });
+
+      describe('root path matching', () => {
+        it('matches repo at root level and CWD in sub-directory (repo at /, CWD at /src)', async () => {
+          const { listRegisteredRepos } = await import('../../src/storage/repo-manager.js');
+          const rootPath = path.resolve('/');
+
+          (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+            {
+              name: handle.repoId,
+              path: rootPath,
+              storagePath: handle.tmpHandle.dbPath,
+              indexedAt: new Date().toISOString(),
+              lastCommit: 'abc123',
+            },
+          ]);
+
+          try {
+            const subDir = path.join(rootPath, 'src');
+            const result = await augment('login', subDir);
+            expect(result.length).toBeGreaterThan(0);
+            expect(result).toContain('[GitNexus]');
+          } finally {
+            (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+              {
+                name: handle.repoId,
+                path: handle.dbPath,
+                storagePath: handle.tmpHandle.dbPath,
+                indexedAt: new Date().toISOString(),
+                lastCommit: 'abc123',
+              },
+            ]);
+          }
+        });
+
+        it('does not attach a nested registered checkout from a parent cwd (repo at /src, CWD at /)', async () => {
+          const { listRegisteredRepos } = await import('../../src/storage/repo-manager.js');
+          const rootPath = path.resolve('/');
+          const subDir = path.join(rootPath, 'src');
+
+          (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+            {
+              name: handle.repoId,
+              path: subDir,
+              storagePath: handle.tmpHandle.dbPath,
+              indexedAt: new Date().toISOString(),
+              lastCommit: 'abc123',
+            },
+          ]);
+
+          try {
+            const result = await augment('login', rootPath);
+            expect(result).toBe('');
+          } finally {
+            (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+              {
+                name: handle.repoId,
+                path: handle.dbPath,
+                storagePath: handle.tmpHandle.dbPath,
+                indexedAt: new Date().toISOString(),
+                lastCommit: 'abc123',
+              },
+            ]);
+          }
+        });
+
+        if (process.platform === 'win32') {
+          it('matches Windows drive-root repo and sub-directory CWD (repo at C:\\, CWD at C:\\src)', async () => {
+            const { listRegisteredRepos } = await import('../../src/storage/repo-manager.js');
+
+            (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+              {
+                name: handle.repoId,
+                path: 'C:\\',
+                storagePath: handle.tmpHandle.dbPath,
+                indexedAt: new Date().toISOString(),
+                lastCommit: 'abc123',
+              },
+            ]);
+
+            try {
+              const result = await augment('login', 'C:\\src');
+              expect(result.length).toBeGreaterThan(0);
+            } finally {
+              (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+                {
+                  name: handle.repoId,
+                  path: handle.dbPath,
+                  storagePath: handle.tmpHandle.dbPath,
+                  indexedAt: new Date().toISOString(),
+                  lastCommit: 'abc123',
+                },
+              ]);
+            }
+          });
+
+          it('does not attach a nested Windows checkout from a drive-root cwd (repo at C:\\src, CWD at C:\\)', async () => {
+            const { listRegisteredRepos } = await import('../../src/storage/repo-manager.js');
+
+            (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+              {
+                name: handle.repoId,
+                path: 'C:\\src',
+                storagePath: handle.tmpHandle.dbPath,
+                indexedAt: new Date().toISOString(),
+                lastCommit: 'abc123',
+              },
+            ]);
+
+            try {
+              const result = await augment('login', 'C:\\');
+              expect(result).toBe('');
+            } finally {
+              (listRegisteredRepos as ReturnType<typeof vi.fn>).mockResolvedValue([
+                {
+                  name: handle.repoId,
+                  path: handle.dbPath,
+                  storagePath: handle.tmpHandle.dbPath,
+                  indexedAt: new Date().toISOString(),
+                  lastCommit: 'abc123',
+                },
+              ]);
+            }
+          });
         }
       });
     });
