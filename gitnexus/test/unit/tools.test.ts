@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 17 tools are defined (per-repo + group_list/group_sync)
+ * - All 19 tools are defined (per-repo + group_list/group_sync)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -23,8 +23,8 @@ const MUTATING_TOOLS = new Set(['rename', 'group_sync']);
 const OPEN_WORLD_READ_ONLY_TOOLS = new Set(['query']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(17);
+  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group + read_file + grep)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(19);
   });
 
   it('contains all expected tool names', () => {
@@ -43,6 +43,8 @@ describe('GITNEXUS_TOOLS', () => {
         'pdg_query',
         'api_impact',
         'trace',
+        'read_file',
+        'grep',
       ]),
     );
   });
@@ -58,6 +60,19 @@ describe('GITNEXUS_TOOLS', () => {
       expect(tool.inputSchema.type).toBe('object');
       expect(tool.inputSchema.properties).toBeDefined();
       expect(Array.isArray(tool.inputSchema.required)).toBe(true);
+      expect(tool.inputSchema.additionalProperties).toBe(false);
+    }
+  });
+
+  it('impact and trace advertise depth as a maxDepth alias (#3261)', () => {
+    for (const name of ['impact', 'trace'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
+      expect(tool.inputSchema.properties.depth).toMatchObject({
+        type: 'number',
+        description: expect.stringMatching(/maxDepth/),
+        minimum: 0,
+      });
+      expect(tool.inputSchema.properties.maxDepth).toBeDefined();
     }
   });
 
@@ -101,6 +116,45 @@ describe('GITNEXUS_TOOLS', () => {
         openWorldHint: false,
       });
     }
+  });
+
+  it('query, context, impact, and cypher descriptions mention always-on staleness (#3291)', () => {
+    for (const name of ['query', 'context', 'impact', 'cypher'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
+      expect(tool.description).toContain('staleness');
+      expect(tool.description).toMatch(/lastCommit|branch/);
+    }
+  });
+
+  it('query process_symbols description names the (id, process_id) join key (#3351)', () => {
+    const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
+    expect(queryTool.description).toContain('One row per (id, process_id)');
+    expect(queryTool.description).toContain('Join a process to its rows by process_id');
+    expect(queryTool.description).toContain('symbol_count is the number of those rows');
+    expect(queryTool.description).toContain('single-repo envelope');
+    expect(queryTool.description).toContain('does not include process_symbols');
+    expect(queryTool.description).toContain('Join processes[].id to process_symbols[].process_id');
+    expect(queryTool.description).toContain(
+      'when service is set, it counts only attaches under that prefix',
+    );
+    expect(queryTool.description).toContain('query again with repo "@<group>/<memberPath>"');
+    expect(queryTool.description).toContain(
+      'content appears only on the first row for each symbol id across the whole process_symbols array, not per process',
+    );
+    expect(queryTool.description).toContain('even under a different process_id');
+    expect(queryTool.description).toContain('context({uid: "<id>", include_content: true})');
+    expect(queryTool.description).toContain(
+      "With include_content, context() also returns that symbol's source.",
+    );
+  });
+
+  it('query include_content property states the once-per-id rule and the context() fallback', () => {
+    const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
+    const description = queryTool.inputSchema.properties.include_content.description;
+    expect(description).toContain('Include source text retained for matching symbols');
+    expect(description).toContain(
+      'Content is sent once per symbol id, on its first process_symbols row; context({uid: "<id>", include_content: true}) returns it for any row.',
+    );
   });
 
   it('query tool requires "search_query" parameter (renamed from "query" for #2175)', () => {
@@ -193,6 +247,17 @@ describe('GITNEXUS_TOOLS', () => {
     expect(impactTool.description).toContain('truncatedBy');
   });
 
+  it('documents riskSharedAxes as a compare aid, not the edit gate', () => {
+    const impactTool = GITNEXUS_TOOLS.find((t) => t.name === 'impact')!;
+    expect(impactTool.description).toContain('riskSharedAxes');
+    expect(impactTool.description).toContain('Never substitute it for `risk`');
+    expect(impactTool.description).toContain('IMPACT_MAX_CHUNKS=0');
+    expect(impactTool.description).toContain('sampled a subset of impacted symbols');
+    expect(impactTool.description).toContain('Graph-RAG');
+    expect(impactTool.description).toContain('cross-repo crossing overlay');
+    expect(impactTool.description).toContain('known HIGH/CRITICAL warnings survive');
+  });
+
   it.each(['query', 'context', 'impact'])(
     '%s advertises an optional positive maxTokens budget',
     (name) => {
@@ -272,10 +337,30 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
-  it('per-repo tools have an optional branch scope param (#2106); group/list tools do not', () => {
+  it('repo descriptions explain the cwd default and mutating exception (#3073)', () => {
+    expect(GITNEXUS_TOOLS.find((tool) => tool.name === 'list_repos')?.description).toMatch(
+      /process cwd/i,
+    );
+    expect(GITNEXUS_TOOLS.find((tool) => tool.name === 'list_repos')?.description).toMatch(
+      /unindexed nested Git checkout/i,
+    );
     for (const tool of GITNEXUS_TOOLS) {
-      if (tool.name === 'list_repos' || GROUP_TOOLS.has(tool.name)) {
-        expect(tool.inputSchema.properties.branch).toBeUndefined();
+      if (tool.name === 'list_repos' || GROUP_TOOLS.has(tool.name)) continue;
+      const description = tool.inputSchema.properties.repo.description;
+      if (tool.name === 'rename') {
+        expect(description).toMatch(/mutating tools require an explicit repo/i);
+      } else {
+        expect(description).toMatch(/process cwd/i);
+        expect(description).toMatch(/unindexed nested Git checkout/i);
+      }
+    }
+  });
+
+  it('per-repo tools have an optional branch scope param (#2106); group/list and checkout file tools do not', () => {
+    const noBranch = new Set(['list_repos', 'read_file', 'grep', ...GROUP_TOOLS]);
+    for (const tool of GITNEXUS_TOOLS) {
+      if (noBranch.has(tool.name)) {
+        expect(tool.inputSchema.properties.branch, tool.name).toBeUndefined();
         continue;
       }
       expect(tool.inputSchema.properties.branch, tool.name).toBeDefined();
@@ -283,6 +368,14 @@ describe('GITNEXUS_TOOLS', () => {
       // Optional — omitting it keeps the default/primary-branch behavior.
       expect(tool.inputSchema.required).not.toContain('branch');
     }
+  });
+
+  it('grep advertises the HTTP caseSensitive and literal flags', () => {
+    const grep = GITNEXUS_TOOLS.find((tool) => tool.name === 'grep')!;
+    expect(grep.inputSchema.properties.caseSensitive.type).toBe('boolean');
+    expect(grep.inputSchema.properties.literal.type).toBe('boolean');
+    expect(grep.description).toContain('hit.line - 1');
+    expect(grep.description).toMatch(/working tree/i);
   });
 
   it('group tools without backend repo param omit repo property', () => {
@@ -312,6 +405,10 @@ describe('GITNEXUS_TOOLS', () => {
     // `not-attempted` is unreachable through this tool; documenting it would
     // advertise an outcome no caller can observe.
     expect(d).not.toContain('not-attempted');
+    expect(d).toContain('READ THE RESULT:');
+    expect(d).toContain('degradedLinks');
+    expect(d).toContain('failedRepos');
+    expect(d).toContain('warnings');
     // 'preserved' rewrites contracts.json (keeping the previous contracts and
     // cross-links, refreshing the diagnostic lists). ITS clause may not say the
     // file was left alone — that sent an operator reading an unchanged mtime to

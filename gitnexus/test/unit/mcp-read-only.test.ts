@@ -10,10 +10,12 @@ const READ_ONLY_TOOLS = [
   'context',
   'detect_changes',
   'explain',
+  'grep',
   'impact',
   'list_repos',
   'pdg_query',
   'query',
+  'read_file',
   'route_map',
   'shape_check',
   'tool_map',
@@ -24,6 +26,7 @@ function createMockBackend() {
   return {
     callTool: vi.fn().mockResolvedValue({ result: 'ok' }),
     listRepos: vi.fn().mockResolvedValue([]),
+    countRepos: vi.fn().mockResolvedValue(0),
     resolveRepo: vi
       .fn()
       .mockResolvedValue({ name: 'test', repoPath: '/tmp/test', lastCommit: 'abc' }),

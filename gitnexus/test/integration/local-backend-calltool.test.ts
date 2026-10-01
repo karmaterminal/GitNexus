@@ -5,9 +5,10 @@
  * instance, verifying cypher, context, impact, and query tools work
  * end-to-end against seeded graph data with FTS indexes.
  */
+import fs from 'fs/promises';
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
-import { listRegisteredRepos } from '../../src/storage/repo-manager.js';
+import { listRegisteredRepos, saveMeta } from '../../src/storage/repo-manager.js';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import {
   LOCAL_BACKEND_SEED_DATA,
@@ -206,6 +207,110 @@ withTestLbugDB(
         // leaked some other node's community onto it. It must have none.
         expect(validate.module).toBeUndefined();
         expect(validate.content).toBe('function validate() {}');
+        // validate is a step in two processes, so it has two process_symbols
+        // rows; content is emitted once per symbol id — only the first row
+        // carries it, the sibling row omits the key entirely.
+        const validateRows = (validateRes.process_symbols ?? []).filter(
+          (s: { id: string }) => s.id === 'func:validate',
+        );
+        expect(validateRows).toHaveLength(2);
+        const withContent = validateRows.filter(
+          (s: { content?: string }) => s.content === 'function validate() {}',
+        );
+        expect(withContent).toHaveLength(1);
+        const withoutContent = validateRows.filter((s: object) => !('content' in s));
+        expect(withoutContent).toHaveLength(1);
+      });
+
+      it('reports content capability for the default full profile', async () => {
+        const query = await backend.callTool('query', { query: 'login', include_content: true });
+        const context = await backend.callTool('context', { name: 'login', include_content: true });
+
+        expect(query.contentAvailability).toEqual({
+          requested: true,
+          profile: 'full',
+          available: true,
+          scope: 'full',
+        });
+        expect(context.contentAvailability).toEqual(query.contentAvailability);
+        expect(context.symbol.content).toBe('function login() {}');
+      });
+
+      it('does not disclose lingering source text when metadata says retention is none', async () => {
+        const storagePath = handle.tmpHandle.dbPath;
+        await saveMeta(storagePath, {
+          repoPath: '/test/repo',
+          storagePath,
+          lastCommit: 'abc123',
+          indexedAt: new Date().toISOString(),
+          contentRetention: 'none',
+          contentRetentionSchemaVersion: 1,
+          ftsProfile: 'name-only',
+        });
+        try {
+          const query = await backend.callTool('query', { query: 'login', include_content: true });
+          const context = await backend.callTool('context', {
+            name: 'login',
+            include_content: true,
+          });
+          const login = (query.process_symbols ?? []).find(
+            (symbol: any) => symbol.id === 'func:login',
+          );
+
+          expect(query.contentAvailability).toEqual({
+            requested: true,
+            profile: 'none',
+            available: false,
+            scope: 'none',
+            reason: 'Source-derived content is not retained by this index.',
+          });
+          expect(login?.content).toBeUndefined();
+          expect(context.contentAvailability).toEqual(query.contentAvailability);
+          expect(context.symbol.content).toBeUndefined();
+        } finally {
+          await Promise.all([
+            fs.rm(`${storagePath}/gitnexus.json`, { force: true }),
+            fs.rm(`${storagePath}/meta.json`, { force: true }),
+          ]);
+        }
+      });
+
+      it('does not disclose lingering source text when retention metadata is invalid', async () => {
+        const storagePath = handle.tmpHandle.dbPath;
+        await saveMeta(storagePath, {
+          repoPath: '/test/repo',
+          storagePath,
+          lastCommit: 'abc123',
+          indexedAt: new Date().toISOString(),
+          contentRetention: 'invalid' as never,
+          contentRetentionSchemaVersion: 1,
+          ftsProfile: 'name-only',
+        });
+        try {
+          const query = await backend.callTool('query', { query: 'login', include_content: true });
+          const context = await backend.callTool('context', {
+            name: 'login',
+            include_content: true,
+          });
+          const login = (query.process_symbols ?? []).find(
+            (symbol: any) => symbol.id === 'func:login',
+          );
+
+          expect(query.contentAvailability).toMatchObject({
+            requested: true,
+            profile: 'none',
+            available: false,
+            scope: 'none',
+          });
+          expect(login?.content).toBeUndefined();
+          expect(context.contentAvailability).toEqual(query.contentAvailability);
+          expect(context.symbol.content).toBeUndefined();
+        } finally {
+          await Promise.all([
+            fs.rm(`${storagePath}/gitnexus.json`, { force: true }),
+            fs.rm(`${storagePath}/meta.json`, { force: true }),
+          ]);
+        }
       });
 
       // PR #222 port: a symbol in MULTIPLE processes is what fully exercises the
@@ -224,12 +329,23 @@ withTestLbugDB(
         expect(processIds).toContain('proc:login-flow');
         expect(processIds).toContain('proc:beta-flow');
 
-        // process_symbols dedups by id, so validate appears once carrying the
-        // pid+step of its top-ranked process — they must come from the SAME
-        // shifted row: login-flow⇒step 2, beta-flow⇒step 3.
-        const v = (res.process_symbols ?? []).find((s: any) => s.id === 'func:validate');
-        expect(v).toBeDefined();
-        expect(v.step_index).toBe(v.process_id === 'proc:beta-flow' ? 3 : 2);
+        // process_symbols keeps one row per (id, process_id): validate is a
+        // step in both flows and must appear under each, with that row's
+        // shifted pid↔step pairing (login-flow⇒step 2, beta-flow⇒step 3).
+        const validates = (res.process_symbols ?? []).filter((s: any) => s.id === 'func:validate');
+        expect(validates).toHaveLength(2);
+        const byProcess = Object.fromEntries(validates.map((s: any) => [s.process_id, s]));
+        expect(byProcess['proc:login-flow']?.step_index).toBe(2);
+        expect(byProcess['proc:beta-flow']?.step_index).toBe(3);
+        expect(byProcess['proc:login-flow']?.is_entry_point).toBeUndefined();
+        expect(byProcess['proc:beta-flow']?.is_entry_point).toBeUndefined();
+        for (const procId of ['proc:login-flow', 'proc:beta-flow'] as const) {
+          const card = (res.processes ?? []).find((p: any) => p.id === procId);
+          const attachCount = (res.process_symbols ?? []).filter(
+            (s: any) => s.process_id === procId,
+          ).length;
+          expect(card?.symbol_count).toBe(attachCount);
+        }
 
         // Ranking: 'login' surfaces proc:login-flow as the top process.
         const loginRes = await backend.callTool('query', { query: 'login' });

@@ -53,6 +53,7 @@ Repository: <name> (<path>)   Worktree: <path>   Index: <commit>, <n> behind HEA
 ```
 
 > If "Index is stale" → run `node .gitnexus/run.cjs analyze` in terminal.
+> Hot-tool `staleness` names which index answered (`branch`/`lastCommit`) and how fresh it is (`status`). Re-analyze only for `behind` or `diverged` — `current` is identity, `unknown` is unmeasurable.
 > If `.gitnexus/run.cjs` is missing, replace `node .gitnexus/run.cjs` with `npx gitnexus` in the fallback commands.
 
 ## Checklist
@@ -92,6 +93,15 @@ callers are not resolvable by the index" (plain-object property access, dynamic
 dispatch, cross-language calls), so few-callers ⇒ LOW does **not** apply. The
 result carries a `riskNote` saying so. Confirm with a text search before
 treating the symbol as safe to change or delete.
+
+`risk` is the edit gate: warn on HIGH/CRITICAL and stop on UNKNOWN until the
+uncertainty is resolved. Within single-repo mode, compare File and symbol
+targets with local `riskSharedAxes` (direct/total only). Within group mode,
+compare only group results: their `riskSharedAxes` overlays resolved
+cross-repo crossings on that local value. Never use either field to waive the
+edit gate. Check `riskScale.unusedAxes` before comparing kinds: MCP File walks
+omit process/module axes, while web Graph-RAG expands File targets to in-file
+symbols before enrichment.
 
 ## Tools
 

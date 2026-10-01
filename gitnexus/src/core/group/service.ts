@@ -6,6 +6,8 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { checkStaleness } from '../git-staleness.js';
+import { stalenessStatus, type StalenessInfo, type StalenessStatus } from '../staleness-status.js';
+import { mapConcurrent } from '../../lib/utils.js';
 import {
   canonicalizePath,
   loadMeta,
@@ -51,6 +53,17 @@ export interface GroupToolPort {
     repo: GroupRepoHandle,
     params: {
       target: string;
+      /**
+       * Target-selector params, same semantics as the single-repo `impact`
+       * tool: `target_uid` is the zero-ambiguity lookup (it wins over the
+       * name), `file_path`/`kind` narrow a name shared by several symbols
+       * (e.g. same-named Api/Impl/Controller layers). The port implementation
+       * consumes them directly; the Phase-1 caller in cross-impact.ts is
+       * responsible for threading them from the MCP `impact` args.
+       */
+      target_uid?: string;
+      file_path?: string;
+      kind?: string;
       direction: 'upstream' | 'downstream';
       maxDepth?: number;
       relationTypes?: string[];
@@ -72,6 +85,7 @@ export interface GroupToolPort {
       limit?: number;
       max_symbols?: number;
       include_content?: boolean;
+      chain_depth?: number;
     },
   ): Promise<unknown>;
   impactByUid(
@@ -101,6 +115,7 @@ export interface GroupToolPort {
       uid?: string;
       file_path?: string;
       include_content?: boolean;
+      chain_depth?: number;
     },
   ): Promise<unknown>;
   // ── Cross-repo trace support (optional on the port) ────────────────
@@ -214,10 +229,17 @@ function filterQueryByServicePrefix(
       servicePrefix,
     ),
   );
-  const allowed = new Set(
-    symbols.map((s) => String((s as { process_id?: string }).process_id ?? '')).filter(Boolean),
-  );
-  const processes = (queryResult.processes || []).filter((p) => allowed.has(String(p.id)));
+  const countByProcess = new Map<string, number>();
+  for (const symbol of symbols) {
+    const pid = String((symbol as { process_id?: string }).process_id ?? '');
+    if (!pid) continue;
+    countByProcess.set(pid, (countByProcess.get(pid) ?? 0) + 1);
+  }
+  const processes = (queryResult.processes || []).filter((p) => countByProcess.has(String(p.id)));
+  for (const process of processes) {
+    const id = String(process.id ?? '');
+    if (id) process.symbol_count = countByProcess.get(id) ?? 0;
+  }
   return { processes, process_symbols: symbols };
 }
 
@@ -429,6 +451,49 @@ function rejectRetiredSyncParams(params: Record<string, unknown>): { error: stri
   return null;
 }
 
+/** Advertised MCP query page bounds (tools.ts schema). Mirrored so core stays MCP-free. */
+const GROUP_QUERY_DEFAULT_LIMIT = 10;
+const GROUP_QUERY_MAX_LIMIT = 100;
+const GROUP_QUERY_DEFAULT_MAX_SYMBOLS = 25;
+const GROUP_QUERY_MAX_SYMBOLS = 200;
+const GROUP_CHAIN_MAX_DEPTH = 3;
+/** Cap per-member fan-out for group query/context. Complements LocalBackend's per-query BFS cap. */
+const GROUP_MEMBER_CONCURRENCY = 4;
+
+function parseGroupQueryBound(
+  value: unknown,
+  field: 'limit' | 'max_symbols',
+  fallback: number,
+  max: number,
+): { ok: true; value: number } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, value: fallback };
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > max) {
+    return {
+      ok: false,
+      error: `Invalid "${field}": expected an integer in [1, ${max}], got ${describeValue(value)}.`,
+    };
+  }
+  return { ok: true, value };
+}
+
+function parseGroupChainDepth(
+  value: unknown,
+): { ok: true; value: number | undefined } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (
+    typeof value !== 'number' ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > GROUP_CHAIN_MAX_DEPTH
+  ) {
+    return {
+      ok: false,
+      error: `Invalid "chain_depth": expected an integer in [0, ${GROUP_CHAIN_MAX_DEPTH}], got ${describeValue(value)}.`,
+    };
+  }
+  return { ok: true, value };
+}
+
 export class GroupService {
   constructor(private readonly port: GroupToolPort) {}
 
@@ -479,8 +544,9 @@ export class GroupService {
     // group tools never need it — so deferring it here keeps that closure off
     // MCP server startup entirely and off every non-sync group call. The CLI
     // already does exactly this at `cli/group.ts`'s sync command.
-    const { syncGroup } = await import('./sync.js');
+    const { syncGroup, formatGroupSyncAmbiguousError } = await import('./sync.js');
     const { GroupSyncLockError } = await import('./group-lock.js');
+    const { RegistryAmbiguousTargetError } = await import('../../storage/repo-manager.js');
     let result: Awaited<ReturnType<typeof syncGroup>>;
     try {
       result = await syncGroup(config, {
@@ -492,6 +558,9 @@ export class GroupService {
         // expects. `SyncOptions.verbose` stays for the CLI, which can see them.
       });
     } catch (err) {
+      if (err instanceof RegistryAmbiguousTargetError) {
+        return { error: formatGroupSyncAmbiguousError(err) };
+      }
       // Fails closed (R9): this sync could not be protected against a concurrent
       // one, so it did not run and wrote nothing. Return it through the same
       // error channel a missing group uses — NEVER as a success payload of zeroes,
@@ -513,6 +582,14 @@ export class GroupService {
       // can otherwise see contract counts that disagree with this payload, with
       // nothing here explaining why the write was skipped.
       registryOutcome: result.registryOutcome,
+      // Data-quality signals surfaced from the sync run: links whose provider
+      // endpoint never resolved to a graph symbol, per-repo extraction
+      // failures with reasons, and operator warnings (e.g. bridge.lbug write
+      // failed after contracts.json was written). Always present so MCP
+      // consumers can branch on them without existence checks.
+      degradedLinks: result.degradedLinks,
+      failedRepos: result.failedRepos,
+      warnings: result.warnings,
     };
   }
 
@@ -621,6 +698,11 @@ export class GroupService {
     if (!uid && !target) {
       return { group: name, error: 'target or uid is required', results: [] };
     }
+    const parsedChainDepth = parseGroupChainDepth(params.chain_depth);
+    if (parsedChainDepth.ok === false) {
+      return { group: name, error: parsedChainDepth.error, results: [] };
+    }
+    const chain_depth = parsedChainDepth.value;
 
     const groupDir = getGroupDir(getDefaultGitnexusDir(), name);
     let config: GroupConfig;
@@ -648,35 +730,44 @@ export class GroupService {
       repoInSubgroup(repoPath, subgroup, subgroupExact),
     );
 
-    const results: GroupContextResult['results'] = await Promise.all(
-      memberEntries.map(async ([repoPath, registryName]) => {
-        try {
-          const repoObj = await this.port.resolveRepo(registryName);
-          const payload = await this.port.context(repoObj, {
-            name: target || undefined,
-            uid,
-            file_path,
-            include_content,
-          });
+    const results: GroupContextResult['results'] = (
+      await mapConcurrent(
+        memberEntries,
+        async ([repoPath, registryName]) => {
+          try {
+            const repoObj = await this.port.resolveRepo(registryName);
+            const payload = await this.port.context(repoObj, {
+              name: target || undefined,
+              uid,
+              file_path,
+              include_content,
+              chain_depth,
+            });
 
-          if (servicePrefix) {
-            const st = (payload as { status?: string })?.status;
-            const sym = (payload as { symbol?: { filePath?: string } })?.symbol;
-            if (st === 'found' && !fileMatchesServicePrefix(sym?.filePath, servicePrefix)) {
-              return { repoPath, registryName, payload: {} };
+            if (servicePrefix) {
+              const st = (payload as { status?: string })?.status;
+              const sym = (payload as { symbol?: { filePath?: string } })?.symbol;
+              if (st === 'found' && !fileMatchesServicePrefix(sym?.filePath, servicePrefix)) {
+                return { repoPath, registryName, payload: {} };
+              }
             }
-          }
 
-          return { repoPath, registryName, payload };
-        } catch (e) {
-          return {
-            repoPath,
-            registryName,
-            payload: { error: e instanceof Error ? e.message : String(e) },
-          };
-        }
-      }),
-    );
+            return { repoPath, registryName, payload };
+          } catch (e) {
+            return {
+              repoPath,
+              registryName,
+              payload: { error: e instanceof Error ? e.message : String(e) },
+            };
+          }
+        },
+        { concurrency: GROUP_MEMBER_CONCURRENCY },
+      )
+    ).map((result, index) => {
+      if (result) return result;
+      const [repoPath, registryName] = memberEntries[index]!;
+      return { repoPath, registryName, payload: {} };
+    });
 
     return {
       group: name,
@@ -699,7 +790,25 @@ export class GroupService {
     }
     const servicePrefix = normalizeServicePrefix(params.service);
 
-    const limit = typeof params.limit === 'number' && params.limit > 0 ? params.limit : 5;
+    const parsedLimit = parseGroupQueryBound(
+      params.limit,
+      'limit',
+      GROUP_QUERY_DEFAULT_LIMIT,
+      GROUP_QUERY_MAX_LIMIT,
+    );
+    if (parsedLimit.ok === false) return { error: parsedLimit.error };
+    const parsedMaxSymbols = parseGroupQueryBound(
+      params.max_symbols,
+      'max_symbols',
+      GROUP_QUERY_DEFAULT_MAX_SYMBOLS,
+      GROUP_QUERY_MAX_SYMBOLS,
+    );
+    if (parsedMaxSymbols.ok === false) return { error: parsedMaxSymbols.error };
+    const parsedChainDepth = parseGroupChainDepth(params.chain_depth);
+    if (parsedChainDepth.ok === false) return { error: parsedChainDepth.error };
+    const limit = parsedLimit.value;
+    const max_symbols = parsedMaxSymbols.value;
+    const chain_depth = parsedChainDepth.value;
     const subgroup = typeof params.subgroup === 'string' ? params.subgroup : undefined;
     const subgroupExact = params.subgroupExact === true;
     const groupDir = getGroupDir(getDefaultGitnexusDir(), name);
@@ -716,33 +825,42 @@ export class GroupService {
       repoInSubgroup(repoPath, subgroup, subgroupExact),
     );
 
-    const perRepo = await Promise.all(
-      memberEntries.map(async ([repoPath, registryName]) => {
-        try {
-          const repoObj = await this.port.resolveRepo(registryName);
-          const queryResult = (await this.port.query(repoObj, {
-            query: queryText,
-            limit,
-            max_symbols: 10,
-            include_content: false,
-          })) as {
-            processes?: Array<Record<string, unknown>>;
-            process_symbols?: Array<Record<string, unknown>>;
-          };
-          const processes = servicePrefix
-            ? filterQueryByServicePrefix(queryResult, servicePrefix).processes
-            : queryResult.processes || [];
-          const scored = processes.map((p, idx) => ({
-            ...p,
-            _rrf_score: 1 / (idx + 1 + 60),
-            _repo: repoPath,
-          }));
-          return { repo: repoPath, score: 0, processes: scored as unknown[] };
-        } catch {
-          return { repo: repoPath, score: 0, processes: [] as unknown[] };
-        }
-      }),
-    );
+    const perRepo = (
+      await mapConcurrent(
+        memberEntries,
+        async ([repoPath, registryName]) => {
+          try {
+            const repoObj = await this.port.resolveRepo(registryName);
+            const queryResult = (await this.port.query(repoObj, {
+              query: queryText,
+              limit,
+              max_symbols,
+              include_content: false,
+              chain_depth,
+            })) as {
+              processes?: Array<Record<string, unknown>>;
+              process_symbols?: Array<Record<string, unknown>>;
+            };
+            const processes = servicePrefix
+              ? filterQueryByServicePrefix(queryResult, servicePrefix).processes
+              : queryResult.processes || [];
+            const scored = processes.map((p, idx) => ({
+              ...p,
+              _rrf_score: 1 / (idx + 1 + 60),
+              _repo: repoPath,
+            }));
+            return { repo: repoPath, score: 0, processes: scored as unknown[] };
+          } catch {
+            return { repo: repoPath, score: 0, processes: [] as unknown[] };
+          }
+        },
+        { concurrency: GROUP_MEMBER_CONCURRENCY },
+      )
+    ).map((result, index) => {
+      if (result) return result;
+      const [repoPath] = memberEntries[index]!;
+      return { repo: repoPath, score: 0, processes: [] as unknown[] };
+    });
 
     const allProcesses = perRepo.flatMap((r) => r.processes as Array<Record<string, unknown>>);
     allProcesses.sort((a, b) => (b._rrf_score as number) - (a._rrf_score as number));
@@ -820,6 +938,17 @@ export class GroupService {
         /** Set only when `unresolvable`; says what could not be resolved. */
         unresolvableReason?: string;
         commitsBehind?: number;
+        /**
+         * What the staleness check could establish (#3256). Additive:
+         * `indexStale` and `commitsBehind` keep their meaning. Two rows report
+         * `unknown` and they do NOT agree on those two fields, so read them
+         * together with this one: no commit was recorded (`indexStale: true`,
+         * `commitsBehind: -1`, the sentinel that case has always used), or the
+         * git probe could not answer (`indexStale: false`, `commitsBehind: 0`,
+         * straight from `checkStaleness`). MCP/HTTP `stalenessPayload` reports
+         * neither number — it omits `commitsBehind` for `unknown` entirely.
+         */
+        status?: StalenessStatus;
       }
     > = {};
 
@@ -849,9 +978,9 @@ export class GroupService {
         const meta: Partial<Pick<RepoMeta, 'lastCommit' | 'indexedAt'>> =
           (await loadMeta(repoObj.storagePath)) ?? {};
 
-        const staleness = meta.lastCommit
+        const staleness: StalenessInfo = meta.lastCommit
           ? checkStaleness(repoObj.repoPath, meta.lastCommit)
-          : { isStale: true, commitsBehind: -1 };
+          : { isStale: true, commitsBehind: -1, status: 'unknown' };
 
         const snapshot = registry?.repoSnapshots?.[repoPath];
         const contractsStale =
@@ -863,6 +992,7 @@ export class GroupService {
           missing: false,
           unresolvable: false,
           commitsBehind: staleness.commitsBehind,
+          status: stalenessStatus(staleness),
         };
       } catch (err) {
         // The registry read succeeded, so its answer about this row is

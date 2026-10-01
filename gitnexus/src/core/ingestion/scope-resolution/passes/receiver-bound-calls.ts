@@ -33,7 +33,8 @@
  *      interface-dispatch fan-out when the folded receiver type is an
  *      Interface (#2832) — same call Cases 0 and 4 make.
  *   8. **Case 4 (simple typeBinding)** — `typeRef.rawName` has no dot →
- *      MRO walk + `findOwnedMember`
+ *      MRO walk + `findOwnedMember`, then an opt-in concrete-subtype fan-out
+ *      when the normal member is missing
  *   9. **Case 5 (value-receiver bridge)** — receiver is a `Const`/`Variable`
  *      whose `nodeId` is referenced as an `ownerId` in `model.methods`
  *      (object-literal services). Last-resort fallback for lowercase
@@ -59,7 +60,13 @@
  * resolved to a wrong target.
  */
 
-import type { ParsedFile, SymbolDefinition } from 'gitnexus-shared';
+import type {
+  ParsedFile,
+  ReferenceSite,
+  ScopeId,
+  SymbolDefinition,
+  TypeRef,
+} from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import type { SemanticModel } from '../../model/semantic-model.js';
@@ -73,6 +80,7 @@ import {
   findEnclosingClassDef,
   isReceiverOwnedButUnbound,
   findExportedDef,
+  findExportedDefIncludingImportedNames,
   findOwnedMember,
   findReceiverTypeBinding,
   findValueBindingInScope,
@@ -86,6 +94,7 @@ import {
   tryEmitEdgeWithExplicitTargetId,
   type CalleeIdCaptureCtx,
 } from '../graph-bridge/edges.js';
+import { constructionSiteReason } from './free-call-fallback.js';
 import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import {
   resolveCompoundReceiverClass,
@@ -98,7 +107,7 @@ import {
   type GroundedTypeArgument,
   type HeritageTypeArguments,
 } from '../utils/generic-instantiation.js';
-import { resolveDefGraphId } from '../graph-bridge/ids.js';
+import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
 import {
   narrowOverloadCandidates,
   isOverloadAmbiguousAfterNormalization,
@@ -118,6 +127,53 @@ const EMIT_RECEIVER_YIELD_BATCH_FILES = 64;
 /** Subset of `ScopeResolver` consumed by this pass. Accepting the
  *  subset rather than the full provider keeps tests and partial
  *  refactors lighter — callers only need to populate what we read. */
+/** Split `text` at the dots that sit at nesting depth 0 and outside string
+ *  literals — `@import("a.zig").Outer.Inner` → three segments, not four;
+ *  `List(u8).Node` → two. The chain walk's segmenter. */
+function splitTopLevelDots(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '(' || ch === '[' || ch === '<') depth++;
+    else if (ch === ')' || ch === ']' || ch === '>') depth--;
+    else if (ch === '.' && depth === 0) {
+      out.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(text.slice(start));
+  return out.filter((s) => s.length > 0);
+}
+
+/** Index of the last depth-0, outside-string dot of `text`, or -1. */
+function lastTopLevelDot(text: string): number {
+  let depth = 0;
+  let inString = false;
+  let last = -1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '(' || ch === '[' || ch === '<') depth++;
+    else if (ch === ')' || ch === ']' || ch === '>') depth--;
+    else if (ch === '.' && depth === 0) last = i;
+  }
+  return last;
+}
+
 type ReceiverBoundProviderSubset = Pick<
   ScopeResolver,
   | 'isSuperReceiver'
@@ -132,12 +188,19 @@ type ReceiverBoundProviderSubset = Pick<
   | 'resolveQualifiedReceiverMember'
   | 'namespaceReceiverPaths'
   | 'resolveReceiverMember'
+  | 'suppressReceiverLookup'
   | 'resolveThisViaEnclosingClass'
+  | 'resolveMissingReceiverMembersFromSubtypes'
+  | 'missingReceiverSubtypeCandidateCompatibility'
+  | 'arityCompatibility'
   | 'conversionRankFn'
   | 'conversionOnlyArgTypePrefixes'
   | 'constraintCompatibility'
   | 'isStaticOnly'
   | 'normalizeTypeArgument'
+  | 'markConstructionSites'
+  | 'namespaceExportsIncludeImportedNames'
+  | 'resolveNamespaceChains'
 >;
 
 /** A bare, undecorated identifier and nothing else — see {@link isBareTypeName}. */
@@ -278,6 +341,37 @@ export const MAX_INTERFACE_DISPATCH_FANOUT = (() => {
 /** Bound on the sample of over-cap interface members kept for the warning. */
 const MAX_REPORTED_SKIPPED_INTERFACES = 20;
 
+/**
+ * Keep every proven subtype target while making omitted coverage explicit.
+ * `recordUnresolved` intentionally depends on candidate coverage, not edge
+ * emission: collapse-mode dedup can make every `tryEmitEdge` return false even
+ * though the site is already known and complete.
+ */
+export function prepareSubtypeDispatchCoverage<T extends { readonly nodeId: string }>(
+  targets: readonly T[],
+  missingCandidateIds: Iterable<string>,
+  maxTargets: number,
+): {
+  readonly targets: readonly T[];
+  readonly droppedTargets: readonly T[];
+  readonly missingCandidateIds: readonly string[];
+  readonly partialCoverage: boolean;
+  readonly recordUnresolved: boolean;
+} {
+  const keptTargets = targets.slice(0, maxTargets);
+  const droppedTargets = targets.slice(maxTargets);
+  const missing = new Set(missingCandidateIds);
+  for (const target of droppedTargets) missing.add(target.nodeId);
+  const partialCoverage = missing.size > 0;
+  return {
+    targets: keptTargets,
+    droppedTargets,
+    missingCandidateIds: [...missing],
+    partialCoverage,
+    recordUnresolved: partialCoverage || targets.length === 0,
+  };
+}
+
 /** What `emitReceiverBoundCalls` reports back to the orchestrator. */
 export interface ReceiverBoundResult {
   /** CALLS/ACCESSES edges emitted by this pass. */
@@ -320,6 +414,9 @@ export async function emitReceiverBoundCalls(
      *  incompatible instantiation. Absent ⇒ every heritage instantiation reads
      *  as unknown ⇒ the pre-#2912 fan-out, unchanged. */
     readonly heritageTypeArguments?: HeritageTypeArguments;
+    /** Classes whose written inheritance includes a base the graph could not
+     * prove. A later inherited member cannot be selected across that gap. */
+    readonly unresolvedInheritanceByClass?: ReadonlySet<string>;
   } = {},
 ): Promise<ReceiverBoundResult> {
   let emitted = 0;
@@ -332,9 +429,145 @@ export async function emitReceiverBoundCalls(
   const fieldFallback = provider.fieldFallbackOnMethodLookup ?? true;
   const collapse = provider.collapseMemberCallsByCallerTarget === true;
   const hoistTypeBindingsToModule = provider.hoistTypeBindingsToModule === true;
+  // Namespace-member lookup for Case 1 / Case 3: local exports only, unless
+  // the provider publishes imported names too (hub modules — see
+  // `ScopeResolver.namespaceExportsIncludeImportedNames`).
+  const lookupNamespaceMember = (targetFile: string, name: string): SymbolDefinition | undefined =>
+    provider.namespaceExportsIncludeImportedNames === true
+      ? findExportedDefIncludingImportedNames(targetFile, name, index, scopes)
+      : findExportedDef(targetFile, name, index);
+  // A class-like member `name` unique across `files`, or nothing — two
+  // same-named classes behind one handle would mint a confident wrong edge.
+  const uniqueClassAcross = (
+    files: readonly string[],
+    name: string,
+  ): SymbolDefinition | undefined => {
+    let picked: SymbolDefinition | undefined;
+    for (const file of files) {
+      const def = lookupNamespaceMember(file, name);
+      if (def === undefined || !isClassLike(def.type)) continue;
+      if (picked !== undefined && picked.nodeId !== def.nodeId) return undefined;
+      picked = def;
+    }
+    return picked;
+  };
+  // A class-like def NESTED in `owner` (`A.Item` inside `A`): its qualified
+  // name is the owner's plus the segment — the identity the structure phase
+  // and `populateClassOwnedMembers` agree on — so the qualified-name index
+  // answers directly; same file as the owner, unique or nothing. Only the
+  // chain walk reads this: `findOwnedMember` knows methods and fields, and a
+  // nested type is neither.
+  const findNestedClass = (owner: SymbolDefinition, name: string): SymbolDefinition | undefined => {
+    if (owner.qualifiedName === undefined || owner.qualifiedName.length === 0) return undefined;
+    let picked: SymbolDefinition | undefined;
+    for (const id of scopes.qualifiedNames.get(`${owner.qualifiedName}.${name}`)) {
+      const def = scopes.defs.get(id);
+      if (def === undefined || !isClassLike(def.type) || def.filePath !== owner.filePath) continue;
+      if (picked !== undefined && picked.nodeId !== def.nodeId) return undefined;
+      picked = def;
+    }
+    return picked;
+  };
+  // Namespace CHAIN walk (`ScopeResolver.resolveNamespaceChains`): resolve
+  // every segment of a qualified prefix from its verified namespace root —
+  // or, failing a namespace, from a class binding in scope (`Outer.Inner`).
+  // The cursor is either "these module files" or "this class"; a hop from a
+  // module is a class-like member of it (→ class) or a namespace-import edge
+  // its module scope binds under the segment — a republished module,
+  // `pub const sub = @import("sub.zig");` (→ files); a hop from a class is a
+  // nested class-like. Anything ambiguous resolves nothing.
+  const walkChains = provider.resolveNamespaceChains === true;
+  const namespaceImportTargetsOf = (file: string, name: string): readonly string[] => {
+    const moduleScope = index.moduleScopeByFile.get(file);
+    if (moduleScope === undefined) return [];
+    const out: string[] = [];
+    for (const edge of scopes.imports.get(moduleScope.id) ?? []) {
+      if (edge.kind !== 'namespace' || edge.localName !== name || edge.targetFile === null)
+        continue;
+      if (!out.includes(edge.targetFile)) out.push(edge.targetFile);
+    }
+    return out;
+  };
+  type ChainCursor =
+    | { readonly files: readonly string[] }
+    | { readonly classDef: SymbolDefinition };
+  const resolveNamespaceChain = (
+    prefix: string,
+    inScope: ScopeId,
+    namespaceTargets: ReadonlyMap<string, readonly string[]>,
+  ): ChainCursor | undefined => {
+    const segments = splitTopLevelDots(prefix);
+    if (segments.length === 0) return undefined;
+    let cursor: ChainCursor | undefined;
+    let rest: readonly string[] = [];
+    // The LONGEST namespace key wins: a provider may bind dotted handles
+    // (`namespaceReceiverPaths`) and an inline `@import("x.zig")` handle
+    // carries a dot of its own inside the quotes.
+    for (let k = segments.length; k >= 1; k--) {
+      const key = segments.slice(0, k).join('.');
+      const files = namespaceTargets.get(key);
+      if (files === undefined) continue;
+      if (isNamespaceNameShadowed(key, inScope, scopes)) return undefined;
+      cursor = { files };
+      rest = segments.slice(k);
+      break;
+    }
+    if (cursor === undefined) {
+      const head = findClassBindingInScope(inScope, segments[0]!, scopes);
+      if (head === undefined || !isClassLike(head.type)) return undefined;
+      cursor = { classDef: head };
+      rest = segments.slice(1);
+    }
+    for (const segment of rest) {
+      if (segment.includes('(') || segment.includes('[')) return undefined;
+      if ('files' in cursor) {
+        const asClass = uniqueClassAcross(cursor.files, segment);
+        const asModule: string[] = [];
+        for (const file of cursor.files) {
+          for (const target of namespaceImportTargetsOf(file, segment)) {
+            if (!asModule.includes(target)) asModule.push(target);
+          }
+        }
+        if (asClass !== undefined && asModule.length > 0) return undefined; // both — refuse
+        if (asClass !== undefined) cursor = { classDef: asClass };
+        else if (asModule.length > 0) cursor = { files: asModule };
+        else return undefined;
+      } else {
+        const nested = findNestedClass(cursor.classDef, segment);
+        if (nested === undefined) return undefined;
+        cursor = { classDef: nested };
+      }
+    }
+    return cursor;
+  };
+  // `ns.Type` as a receiver, where `ns` is a verified namespace of the current
+  // file and `Type` a class-like member of it — or, with the chain walk, any
+  // `a.b.c.Type` whose prefix resolves. Unique or nothing.
+  const resolveNamespaceQualifiedClass = (
+    receiverName: string,
+    inScope: ScopeId,
+    namespaceTargets: ReadonlyMap<string, readonly string[]>,
+  ): SymbolDefinition | undefined => {
+    const dot = walkChains ? lastTopLevelDot(receiverName) : receiverName.lastIndexOf('.');
+    if (dot <= 0 || dot === receiverName.length - 1) return undefined;
+    const head = receiverName.slice(0, dot);
+    const tail = receiverName.slice(dot + 1);
+    if (tail.includes('(') || tail.includes('[')) return undefined;
+    if (walkChains) {
+      const cursor = resolveNamespaceChain(head, inScope, namespaceTargets);
+      if (cursor === undefined) return undefined;
+      return 'classDef' in cursor
+        ? findNestedClass(cursor.classDef, tail)
+        : uniqueClassAcross(cursor.files, tail);
+    }
+    const files = namespaceTargets.get(head);
+    if (files === undefined || isNamespaceNameShadowed(head, inScope, scopes)) return undefined;
+    return uniqueClassAcross(files, tail);
+  };
   const compoundOpts = {
     fieldFallback,
     elementTypeOf: provider.elementTypeOf,
+    namespaceExportsIncludeImportedNames: provider.namespaceExportsIncludeImportedNames === true,
     hoistTypeBindingsToModule,
     stripReceiverCastExpressions: provider.stripReceiverCastExpressions === true,
     constructionSyntax: provider.constructionSyntax,
@@ -483,6 +716,32 @@ export async function emitReceiverBoundCalls(
     const graphId = resolveDefGraphId(def.filePath, def, nodeLookup);
     if (graphId === undefined) return false;
     return graph.getNode(graphId)?.properties.isStatic === true;
+  };
+
+  const missingReceiverSubtypeDecision = (
+    typeRef: TypeRef,
+    site: ReferenceSite,
+  ): boolean | 'suppress' => {
+    const predicate = provider.resolveMissingReceiverMembersFromSubtypes;
+    if (predicate === undefined) return false;
+    const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
+    const callerIsStatic =
+      callerGraphId === undefined ? undefined : graph.getNode(callerGraphId)?.properties.isStatic;
+    const receiverBindingGraphId = resolveCallerGraphId(
+      typeRef.declaredAtScope,
+      scopes,
+      nodeLookup,
+    );
+    const receiverBindingIsStatic =
+      receiverBindingGraphId === undefined
+        ? undefined
+        : graph.getNode(receiverBindingGraphId)?.properties.isStatic;
+    return predicate(typeRef, {
+      callerIsStatic,
+      receiverBindingIsStatic,
+      memberName: site.name,
+      callArity: site.arity,
+    });
   };
 
   /**
@@ -793,7 +1052,16 @@ export async function emitReceiverBoundCalls(
       receiverPaths: provider.namespaceReceiverPaths,
       moduleFileExists: (filePath) => index.moduleScopeByFile.has(filePath),
     });
-    const fileCompoundOpts = { ...compoundOpts, namespaceTargets };
+    const fileCompoundOpts = {
+      ...compoundOpts,
+      namespaceTargets,
+      ...(walkChains
+        ? {
+            resolveQualifiedClass: (qualifiedName: string, inScope: ScopeId) =>
+              resolveNamespaceQualifiedClass(qualifiedName, inScope, namespaceTargets),
+          }
+        : {}),
+    };
     // Per-file resolved-callee-id capture context (#2227 U2). Built once per
     // file; `undefined` when the sink is absent (pdg off) so the `tryEmitEdge`
     // capture is a no-op and emission stays byte-identical (R4).
@@ -809,6 +1077,30 @@ export async function emitReceiverBoundCalls(
       const receiverName = site.explicitReceiver.name;
       const memberName = site.name;
       const siteKey = `${parsed.filePath}:${site.atRange.startLine}:${site.atRange.startCol}`;
+
+      if (provider.suppressReceiverLookup !== undefined) {
+        const baseName =
+          decodeReceiverChain(site.receiverChain)?.baseReceiverName ??
+          receiverName.split(/[.([\s]/, 1)[0];
+        const baseTypeRef =
+          baseName === undefined
+            ? undefined
+            : findReceiverTypeBinding(site.inScope, baseName, scopes);
+        if (baseTypeRef !== undefined && provider.suppressReceiverLookup(baseTypeRef)) {
+          options.recordResolutionOutcome?.({
+            kind: 'suppressed',
+            reason: 'receiver-unresolved',
+            candidateIds: [],
+            phase: 'receiver-bound-calls',
+            filePath: parsed.filePath,
+            name: site.name,
+            range: site.atRange,
+            siteKind: site.kind,
+          });
+          handledSites.add(siteKey);
+          continue;
+        }
+      }
 
       // ── owned-but-unbound receiver ───────────────────────────────
       // The language declared this scope REBINDS the receiver and gave
@@ -1280,15 +1572,22 @@ export async function emitReceiverBoundCalls(
       // that is usually empty. Mirrors the order the compound-receiver
       // construction path already uses.
       const namespaceCandidates = namespaceTargets.get(receiverName);
-      const targetFiles =
+      let targetFiles: readonly string[] | undefined =
         namespaceCandidates !== undefined &&
         !isNamespaceNameShadowed(receiverName, site.inScope, scopes)
           ? namespaceCandidates
           : undefined;
+      // Chain walk: `hub.sub.helper()` / `hub.sub.Thing{}` — the receiver is
+      // no handle of this file, but its segments reach a module (see
+      // `resolveNamespaceChain`). A prefix that ends in a CLASS is Case 2's.
+      if (targetFiles === undefined && walkChains && lastTopLevelDot(receiverName) > 0) {
+        const cursor = resolveNamespaceChain(receiverName, site.inScope, namespaceTargets);
+        if (cursor !== undefined && 'files' in cursor) targetFiles = cursor.files;
+      }
       if (targetFiles !== undefined && provider.resolveQualifiedReceiverMember === undefined) {
         let found = false;
         for (const targetFile of targetFiles) {
-          const memberDef = findExportedDef(targetFile, memberName, index);
+          const memberDef = lookupNamespaceMember(targetFile, memberName);
           if (memberDef !== undefined) {
             if (
               suppressDeletedCallTarget(
@@ -1308,7 +1607,15 @@ export async function emitReceiverBoundCalls(
               nodeLookup,
               site,
               memberDef,
-              memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
+              // A namespace-qualified construction site (`mod.T{…}`) resolves
+              // here like `mod.fn()` does; the provider's opt-in marker keeps
+              // it distinguishable from an invocation (see
+              // `ScopeResolver.markConstructionSites`).
+              constructionSiteReason(
+                memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
+                site,
+                provider.markConstructionSites,
+              ),
               seen,
               0.85,
               collapse,
@@ -1384,7 +1691,16 @@ export async function emitReceiverBoundCalls(
       }
 
       // ── Case 2: class-name receiver ──────────────────────────────
-      const classDef = findClassBindingInScope(site.inScope, receiverName, scopes);
+      // A namespace-qualified class (`stdx.PRNG.from_seed()`, `terminal
+      // .Terminal.init()`) binds nothing in the caller's scope chain; when the
+      // head names a verified namespace, the tail is looked up as that
+      // module's member — through the same lookup Case 1 / Case 3 use, so a
+      // hub module (a file made only of re-exports) answers when the provider
+      // opted in. Only a bare tail is walked here; `ns.Type.field.m()` is the
+      // compound resolver's shape.
+      const classDef =
+        findClassBindingInScope(site.inScope, receiverName, scopes) ??
+        resolveNamespaceQualifiedClass(receiverName, site.inScope, namespaceTargets);
       if (classDef !== undefined) {
         const chain = [classDef.nodeId, ...scopes.methodDispatch.mroFor(classDef.nodeId)];
         let memberDef: SymbolDefinition | undefined;
@@ -1428,6 +1744,45 @@ export async function emitReceiverBoundCalls(
           handledSites.add(siteKey);
           continue;
         }
+        // `A.Item{}` / `mod.Outer.Inner{}` — a construction whose member is a
+        // type NESTED in the class the receiver names. Neither a method nor a
+        // field, so the owner walk above cannot see it; the chain walk's
+        // nested-class lookup can (`resolveNamespaceChains`).
+        if (memberDef === undefined && walkChains && site.callForm === 'constructor') {
+          const nested = findNestedClass(classDef, memberName);
+          if (nested !== undefined) {
+            if (
+              suppressDeletedCallTarget(
+                options.recordResolutionOutcome,
+                parsed.filePath,
+                site,
+                nested,
+              )
+            ) {
+              handledSites.add(siteKey);
+              continue;
+            }
+            const ok = tryEmitEdge(
+              graph,
+              scopes,
+              nodeLookup,
+              site,
+              nested,
+              constructionSiteReason(
+                nested.filePath !== parsed.filePath ? 'import-resolved' : 'global',
+                site,
+                provider.markConstructionSites,
+              ),
+              seen,
+              0.85,
+              collapse,
+              calleeCapture,
+            );
+            if (ok) emitted++;
+            handledSites.add(siteKey);
+            continue;
+          }
+        }
         if (memberDef !== undefined) {
           if (
             suppressDeletedCallTarget(
@@ -1470,11 +1825,23 @@ export async function emitReceiverBoundCalls(
       if (typeRef !== undefined && typeRef.rawName.includes('.')) {
         const [nsName, ...classNameParts] = typeRef.rawName.split('.');
         const className = classNameParts.join('.');
-        const targetFiles3 = namespaceTargets.get(nsName);
+        // With the chain walk the dotted type is resolved as a whole
+        // (`x: mod.Outer.Inner`, `t: hub.sub.Thing`); the candidate list then
+        // has one entry or none. Without it: the historical one-hop split.
+        const chainDef3 = walkChains
+          ? resolveNamespaceQualifiedClass(typeRef.rawName, site.inScope, namespaceTargets)
+          : undefined;
+        const targetFiles3 = walkChains
+          ? chainDef3 === undefined
+            ? undefined
+            : [chainDef3.filePath]
+          : namespaceTargets.get(nsName);
         if (targetFiles3 !== undefined && className.length > 0) {
           let found3 = false;
           for (const targetFile3 of targetFiles3) {
-            const classDef3 = findExportedDef(targetFile3, className, index);
+            const classDef3 = walkChains
+              ? chainDef3
+              : lookupNamespaceMember(targetFile3, className);
             if (classDef3 !== undefined) {
               const picked =
                 site.kind === 'call'
@@ -1514,7 +1881,15 @@ export async function emitReceiverBoundCalls(
                   nodeLookup,
                   site,
                   memberDef,
-                  memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
+                  // Same marker rule as Case 1 / Case 2: a constructor-form site
+                  // reached through a dotted type binding keeps its
+                  // ` (constructor)` suffix when the provider opted in; for
+                  // every other provider the string is unchanged.
+                  constructionSiteReason(
+                    memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
+                    site,
+                    provider.markConstructionSites,
+                  ),
                   seen,
                   // Explicit defaults so the trailing capture ctx (#2227 U2) can
                   // be threaded without changing dedup/confidence behavior.
@@ -1973,6 +2348,228 @@ export async function emitReceiverBoundCalls(
             // if the edge was deduplicated (collapse mode), so
             // `emitReferencesViaLookup` doesn't re-emit from the
             // reference index.
+            handledSites.add(siteKey);
+            continue;
+          }
+
+          // Dynamic subtype dispatch for a receiver whose declared owner and
+          // ancestors do not define the member. The provider predicate keeps
+          // language syntax out of this shared pass; Python opts in only for
+          // instance `self` calls made from mixin-style base classes.
+          //
+          // Multiple concrete subtype implementations are runtime alternatives,
+          // not an overload ambiguity, so emit the same bounded fan-out used by
+          // interface dispatch. An ambiguity *within* one subtype does not erase
+          // proven targets from other subtypes; it marks the site's coverage as
+          // partial so callers cannot mistake the emitted set for completeness.
+          const subtypeDecision =
+            site.kind === 'call' ? missingReceiverSubtypeDecision(typeRef, site) : false;
+          if (subtypeDecision !== false) {
+            if (subtypeDecision === 'suppress') {
+              options.recordResolutionOutcome?.({
+                kind: 'suppressed',
+                reason: 'receiver-unresolved',
+                receiverOrigin: 'in-program',
+                candidateIds: [],
+                phase: 'receiver-bound-calls',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                siteKind: site.kind,
+              });
+              handledSites.add(siteKey);
+              continue;
+            }
+            const subtypeTargets = new Map<string, SymbolDefinition>();
+            const ambiguousCandidateIds = new Set<string>();
+            const unknownCompatibilityCandidateIds = new Set<string>();
+            const incompleteInheritanceSubtypeIds = new Set<string>();
+            const missingMemberSubtypeIds = new Set<string>();
+            const visitedSubtypeIds = new Set<string>([ownerDef.nodeId]);
+            const subtypeQueue = [ownerDef.nodeId];
+            let subtypeHead = 0;
+
+            while (subtypeHead < subtypeQueue.length) {
+              const supertypeId = subtypeQueue[subtypeHead++]!;
+              for (const subtype of subtypesBySupertypeDefId.get(supertypeId) ?? []) {
+                if (visitedSubtypeIds.has(subtype.nodeId)) continue;
+                visitedSubtypeIds.add(subtype.nodeId);
+                subtypeQueue.push(subtype.nodeId);
+
+                // Prefer a concrete override owned by this subtype. Otherwise
+                // take the first inherited provider in MRO order. Python's
+                // MRO is C3, so that first provider is the method CPython
+                // binds. A later base that also defines the name is hidden,
+                // the same way a class-body field hides a method.
+                //
+                //   class Worker(HookMixin, Helpers): ...
+                //
+                // `Helpers` is not itself a subtype of HookMixin, so the
+                // subtype closure cannot discover it. The MRO is the bridge.
+                let subtypeAmbiguous = false;
+                let picked: SymbolDefinition | undefined;
+                const effectiveOwners = [
+                  subtype.nodeId,
+                  ...scopes.methodDispatch.mroFor(subtype.nodeId),
+                ];
+                let unresolvedBaseBeforeOwner = false;
+                for (const effectiveOwnerId of effectiveOwners) {
+                  if (unresolvedBaseBeforeOwner) {
+                    incompleteInheritanceSubtypeIds.add(subtype.nodeId);
+                    break;
+                  }
+                  // A method on this owner still binds before its own bases.
+                  // If no member binds here, an unresolved base may precede
+                  // every later owner in the runtime MRO.
+                  unresolvedBaseBeforeOwner =
+                    options.unresolvedInheritanceByClass?.has(effectiveOwnerId) === true;
+                  const overloads = model.methods.lookupAllByOwner(effectiveOwnerId, memberName);
+                  const field = model.fields.lookupFieldByOwner(effectiveOwnerId, memberName);
+                  if (field !== undefined) {
+                    ambiguousCandidateIds.add(field.nodeId);
+                    for (const overload of overloads) ambiguousCandidateIds.add(overload.nodeId);
+                    subtypeAmbiguous = true;
+                    break;
+                  }
+                  if (overloads.length === 0) continue;
+                  const candidate = pickFirstNonStaticOnly(
+                    effectiveOwnerId,
+                    memberName,
+                    site,
+                    model,
+                    provider,
+                  );
+                  if (candidate === OVERLOAD_AMBIGUOUS) {
+                    for (const overload of overloads) ambiguousCandidateIds.add(overload.nodeId);
+                    subtypeAmbiguous = true;
+                    break;
+                  }
+                  if (candidate === STATIC_ONLY_FILTERED) continue;
+                  if (candidate !== undefined) {
+                    if (isDeclarationOnly(candidate)) {
+                      // An abstract declaration still binds the name for this
+                      // owner. Do not expose a concrete method hidden in a base;
+                      // concrete descendants are visited as their own subtypes.
+                      ambiguousCandidateIds.add(candidate.nodeId);
+                      subtypeAmbiguous = true;
+                      break;
+                    }
+                    if (provider.arityCompatibility(site, candidate) === 'incompatible') {
+                      // The owner bound this name. Python-style lookup cannot
+                      // skip an incompatible override and expose a hidden base.
+                      subtypeAmbiguous = true;
+                      break;
+                    }
+                    const subtypeCompatibility =
+                      provider.missingReceiverSubtypeCandidateCompatibility?.(site, candidate, {
+                        callerFilePath: parsed.filePath,
+                      });
+                    if (subtypeCompatibility === 'incompatible') {
+                      subtypeAmbiguous = true;
+                      break;
+                    }
+                    if (subtypeCompatibility === 'unknown') {
+                      unknownCompatibilityCandidateIds.add(candidate.nodeId);
+                      subtypeAmbiguous = true;
+                      break;
+                    }
+                    if (
+                      candidate.isDeleted === true ||
+                      isUnreachableByInstanceDispatch(candidate)
+                    ) {
+                      continue;
+                    }
+                    // First compatible definition in MRO order. Do not keep
+                    // scanning: a later base is not the runtime target.
+                    picked = candidate;
+                    break;
+                  }
+                }
+                if (unresolvedBaseBeforeOwner && picked === undefined && !subtypeAmbiguous) {
+                  // The final known owner can have a base absent from the
+                  // indexed MRO, leaving this subtype's target unproven.
+                  incompleteInheritanceSubtypeIds.add(subtype.nodeId);
+                }
+                if (subtypeAmbiguous) continue;
+                if (picked === undefined) {
+                  // This runtime subtype has no proven binding. Preserve
+                  // partial coverage even when a sibling supplies a target.
+                  missingMemberSubtypeIds.add(subtype.nodeId);
+                  continue;
+                }
+                subtypeTargets.set(picked.nodeId, picked);
+              }
+            }
+
+            if (ambiguousCandidateIds.size > 0) {
+              options.recordResolutionOutcome?.({
+                kind: 'suppressed',
+                phase: 'receiver-bound-calls',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                reason: 'member-lookup-ambiguous',
+                candidateIds: [...ambiguousCandidateIds],
+              });
+            }
+
+            const allTargets = [...subtypeTargets.values()];
+            const coverage = prepareSubtypeDispatchCoverage(
+              allTargets,
+              new Set([
+                ...ambiguousCandidateIds,
+                ...unknownCompatibilityCandidateIds,
+                ...incompleteInheritanceSubtypeIds,
+                ...missingMemberSubtypeIds,
+              ]),
+              MAX_INTERFACE_DISPATCH_FANOUT,
+            );
+            const targets = coverage.targets;
+            if (coverage.droppedTargets.length > 0) {
+              dispatchFanoutSkipped += coverage.droppedTargets.length;
+              if (dispatchFanoutSkippedNames.length < MAX_REPORTED_SKIPPED_INTERFACES) {
+                const dropped = coverage.droppedTargets
+                  .slice(0, 5)
+                  .map((target) => target.qualifiedName ?? target.nodeId);
+                const omitted = coverage.droppedTargets.length - dropped.length;
+                dispatchFanoutSkippedNames.push(
+                  `${ownerDef.qualifiedName ?? ownerDef.nodeId}.${memberName} (${allTargets.length} targets; ` +
+                    `dropped: ${dropped.join(', ')}${omitted > 0 ? `, +${omitted} more` : ''})`,
+                );
+              }
+            }
+
+            for (const target of targets) {
+              const ok = tryEmitEdge(
+                graph,
+                scopes,
+                nodeLookup,
+                site,
+                target,
+                'interface-dispatch',
+                seen,
+                0.85,
+                collapse,
+                calleeCapture,
+              );
+              if (ok) {
+                emitted++;
+              }
+            }
+
+            if (coverage.recordUnresolved) {
+              options.recordResolutionOutcome?.({
+                kind: 'suppressed',
+                reason: 'receiver-unresolved',
+                receiverOrigin: 'in-program',
+                candidateIds: coverage.missingCandidateIds,
+                phase: 'receiver-bound-calls',
+                filePath: parsed.filePath,
+                name: site.name,
+                range: site.atRange,
+                siteKind: site.kind,
+              });
+            }
             handledSites.add(siteKey);
             continue;
           }

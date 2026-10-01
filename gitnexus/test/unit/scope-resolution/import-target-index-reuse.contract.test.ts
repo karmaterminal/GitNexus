@@ -389,8 +389,8 @@ const FIXTURES: ReadonlyMap<SupportedLanguages, ImportTargetFixture> = new Map<
   [
     SupportedLanguages.CPlusPlus,
     {
-      // Same accounting as C: `resolveCppImportTarget` delegates to the C
-      // resolver's basename index, keyed on the same Set.
+      // Same accounting as C. C++ keeps its own basename index, still keyed
+      // on this set, so the traversal count stays a function of the set.
       files: ['include/util.hpp', 'src/helper.hpp', 'src/main.cpp'],
       fromFile: 'src/main.cpp',
       resolutionConfig: undefined,
@@ -519,10 +519,45 @@ const FIXTURES: ReadonlyMap<SupportedLanguages, ImportTargetFixture> = new Map<
       files: ['lib/models.dart', 'tool/generate.dart', 'lib/main.dart'],
       fromFile: 'lib/main.dart',
       resolutionConfig: undefined,
-      // An external package: both `lib/<rel>` and bare `<rel>` miss, which is
-      // the two-scan case.
-      missTarget: (i) => `package:vendor${i}/ghost.dart`,
-      hitTarget: 'package:app/models.dart',
+      // Package imports are exact lookups; relative misses exercise the index.
+      missTarget: (i) => `vendor${i}/ghost.dart`,
+      hitTarget: './models.dart',
+      parsedImport: IGNORES_CONTEXT,
+      minimumScans: 1,
+      minimumParsedFileReads: 0,
+    },
+  ],
+  [
+    SupportedLanguages.Zig,
+    {
+      files: ['src/util.zig', 'src/main.zig'],
+      fromFile: 'src/main.zig',
+      resolutionConfig: undefined,
+      // A relative `@import` that names no file: the resolver walks the path
+      // arithmetically from `fromFile` and probes the Set with two `has` calls
+      // (`<candidate>` and `<candidate>.zig`) — membership probes only, no
+      // traversal, the same shape as Rust. Bare names go through the
+      // build.zig.zon `.path` map (a Map lookup) and never touch the Set.
+      missTarget: (i) => `ghost${i}.zig`,
+      hitTarget: 'util.zig',
+      parsedImport: IGNORES_CONTEXT,
+      // See `minimumScans` on the interface: membership probes only.
+      minimumScans: 0,
+      minimumParsedFileReads: 0,
+    },
+  ],
+  [
+    SupportedLanguages.ObjectiveC,
+    {
+      // `resolutionConfig` is the workspace scan from `loadResolutionConfig`
+      // (headers / frameworks / xcconfig). Left undefined so the resolver
+      // indexes THIS set: with scanned headers present the adapter unions
+      // them once, and that union's scan is the only one this counter sees.
+      files: ['Headers/Widget.h', 'Sources/main.m'],
+      fromFile: 'Sources/main.m',
+      resolutionConfig: undefined,
+      missTarget: (i) => `ghost${i}.h`,
+      hitTarget: 'Widget.h',
       parsedImport: IGNORES_CONTEXT,
       minimumScans: 1,
       minimumParsedFileReads: 0,

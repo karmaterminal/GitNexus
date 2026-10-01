@@ -123,6 +123,7 @@ import {
   DEFERRED_IMPORT_REASON_SUFFIX,
   TYPE_ONLY_IMPORT_REASON_SUFFIX,
 } from '../../src/core/ingestion/scope-resolution/graph-bridge/imports-to-edges.js';
+import { DART_PACKAGE_IDENTITY_REASON } from '../../src/core/ingestion/languages/dart/package-dependencies.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -292,6 +293,86 @@ describe('LocalBackend.init', () => {
     await backend.init();
     expect(listRegisteredRepos).toHaveBeenCalledWith({ validate: true });
   });
+
+  it('does not delete legacy Kuzu files while initializing a read backend', async () => {
+    setupSingleRepo();
+
+    await backend.init();
+
+    expect(cleanupOldKuzuFiles).not.toHaveBeenCalled();
+  });
+});
+
+describe('LocalBackend.countRepos', () => {
+  let backend: LocalBackend;
+
+  beforeEach(() => {
+    backend = new LocalBackend();
+    vi.clearAllMocks();
+  });
+
+  it('counts the validated registry, ignoring raw ENOENT ghost entries', async () => {
+    (listRegisteredRepos as any).mockImplementation(async (opts?: { validate?: boolean }) =>
+      opts?.validate
+        ? [MOCK_REPO_ENTRY]
+        : [
+            MOCK_REPO_ENTRY,
+            {
+              ...MOCK_REPO_ENTRY,
+              name: 'ghost-project',
+              path: '/tmp/ghost-project',
+              storagePath: '/tmp/.gitnexus/ghost-project',
+            },
+          ],
+    );
+
+    await expect(backend.countRepos()).resolves.toBe(1);
+    expect(listRegisteredRepos).toHaveBeenCalledWith({ validate: true });
+  });
+
+  it('returns 0 when every registry row is a ghost', async () => {
+    (listRegisteredRepos as any).mockImplementation(async (opts?: { validate?: boolean }) =>
+      opts?.validate
+        ? []
+        : [
+            {
+              ...MOCK_REPO_ENTRY,
+              name: 'ghost-a',
+              path: '/tmp/ghost-a',
+              storagePath: '/tmp/.gitnexus/ghost-a',
+            },
+            {
+              ...MOCK_REPO_ENTRY,
+              name: 'ghost-b',
+              path: '/tmp/ghost-b',
+              storagePath: '/tmp/.gitnexus/ghost-b',
+            },
+          ],
+    );
+
+    await expect(backend.countRepos()).resolves.toBe(0);
+    expect(listRegisteredRepos).toHaveBeenCalledWith({ validate: true });
+  });
+
+  it('reports the in-memory size after refresh, not the raw registry file', async () => {
+    (listRegisteredRepos as any).mockImplementation(async (opts?: { validate?: boolean }) =>
+      opts?.validate
+        ? [MOCK_REPO_ENTRY]
+        : [
+            MOCK_REPO_ENTRY,
+            {
+              ...MOCK_REPO_ENTRY,
+              name: 'ghost-project',
+              path: '/tmp/ghost-project',
+              storagePath: '/tmp/.gitnexus/ghost-project',
+            },
+          ],
+    );
+
+    expect(backend.cachedRepoCount()).toBe(0);
+    await backend.init();
+    expect(backend.cachedRepoCount()).toBe(1);
+  });
 });
 
 describe('LocalBackend.disconnect', () => {
@@ -361,7 +442,10 @@ describe('LocalBackend.callTool', () => {
         direction: 'upstream',
       });
 
-      expect(result).toEqual({ status: 'normalized' });
+      // toMatchObject, not toEqual: since #3291 every hot-read-tool response
+      // also carries the `staleness` ref field. This test is about parameter
+      // normalization, so it pins the payload it cares about and ignores it.
+      expect(result).toMatchObject({ status: 'normalized' });
       const dispatched = impactSpy.mock.calls[0][1] as Record<string, unknown>;
       expect(dispatched.target).toBe('validate');
       expect(dispatched).not.toHaveProperty('name');
@@ -379,7 +463,8 @@ describe('LocalBackend.callTool', () => {
       file: ' src/auth.ts ',
     });
 
-    expect(result).toEqual({ status: 'normalized' });
+    // toMatchObject: responses carry the #3291 `staleness` ref field too.
+    expect(result).toMatchObject({ status: 'normalized' });
     const dispatched = contextSpy.mock.calls[0][1] as Record<string, unknown>;
     expect(dispatched.file_path).toBe('src/auth.ts');
     expect(dispatched).not.toHaveProperty('file');
@@ -396,8 +481,37 @@ describe('LocalBackend.callTool', () => {
       file: undefined,
     });
 
-    expect(result).toEqual({ status: 'normalized' });
+    // toMatchObject: responses carry the #3291 `staleness` ref field too.
+    expect(result).toMatchObject({ status: 'normalized' });
     expect(contextSpy.mock.calls[0][1]).toMatchObject({ name: 'validate' });
+  });
+
+  it('treats adapter-materialized blank optional aliases as absent', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+    const contextSpy = vi
+      .spyOn(backend as any, 'context')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target: 'validate',
+      name: '',
+      symbol: ' ',
+      direction: 'upstream',
+    });
+    await backend.callTool('context', {
+      name: 'validate',
+      file_path: '',
+      file: ' ',
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate' });
+    expect(impactSpy.mock.calls[0][1]).not.toHaveProperty('name');
+    expect(impactSpy.mock.calls[0][1]).not.toHaveProperty('symbol');
+    expect(contextSpy.mock.calls[0][1]).toMatchObject({ name: 'validate' });
+    expect(contextSpy.mock.calls[0][1]).not.toHaveProperty('file_path');
+    expect(contextSpy.mock.calls[0][1]).not.toHaveProperty('file');
   });
 
   it('allows agreeing canonical and alias values after trimming', async () => {
@@ -415,12 +529,44 @@ describe('LocalBackend.callTool', () => {
     expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate' });
   });
 
+  it('folds CLI-style depth onto maxDepth before impact (#3261)', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target: 'validate',
+      direction: 'upstream',
+      depth: 2,
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate', maxDepth: 2 });
+    expect(impactSpy.mock.calls[0][1]).not.toHaveProperty('depth');
+  });
+
+  it('treats depth 0 as omitted when maxDepth is present (#2279)', async () => {
+    const impactSpy = vi
+      .spyOn(backend as any, 'impact')
+      .mockResolvedValue({ status: 'normalized' });
+
+    await backend.callTool('impact', {
+      target: 'validate',
+      direction: 'upstream',
+      maxDepth: 2,
+      depth: 0,
+    });
+
+    expect(impactSpy.mock.calls[0][1]).toMatchObject({ target: 'validate', maxDepth: 2 });
+    expect(impactSpy.mock.calls[0][1]).not.toHaveProperty('depth');
+  });
+
   it.each([
     ['impact', { target: 'validate', name: 'login', direction: 'upstream' }],
     ['impact', { name: 'validate', symbol: 'login', direction: 'upstream' }],
+    ['impact', { target: 'validate', direction: 'upstream', maxDepth: 3, depth: 1 }],
     ['context', { name: 'validate', file_path: 'src/auth.ts', file: 'src/login.ts' }],
   ])('rejects conflicting %s aliases before repository resolution', async (method, params) => {
-    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+    const resolveSpy = vi.spyOn(backend, 'selectToolRepository');
 
     const result = await backend.callTool(method, params);
 
@@ -429,12 +575,10 @@ describe('LocalBackend.callTool', () => {
   });
 
   it.each([
-    ['impact', { target: '', direction: 'upstream' }],
     ['impact', { name: 42, direction: 'upstream' }],
-    ['context', { name: 'validate', file: '   ' }],
     ['context', { name: 'validate', file: null }],
   ])('rejects invalid %s aliases before repository resolution', async (method, params) => {
-    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+    const resolveSpy = vi.spyOn(backend, 'selectToolRepository');
 
     const result = await backend.callTool(method, params);
 
@@ -442,8 +586,21 @@ describe('LocalBackend.callTool', () => {
     expect(resolveSpy).not.toHaveBeenCalled();
   });
 
+  it('still rejects a blank required impact target before repository resolution', async () => {
+    const resolveSpy = vi.spyOn(backend, 'selectToolRepository');
+
+    const result = await backend.callTool('impact', {
+      target: '',
+      name: ' ',
+      direction: 'upstream',
+    });
+
+    expect(result.error).toMatch(/requires target, name, symbol, or target_uid/i);
+    expect(resolveSpy).not.toHaveBeenCalled();
+  });
+
   it('rejects a missing impact target before repository resolution', async () => {
-    const resolveSpy = vi.spyOn(backend, 'resolveRepo');
+    const resolveSpy = vi.spyOn(backend, 'selectToolRepository');
 
     const result = await backend.callTool('impact', { direction: 'upstream' });
 
@@ -463,6 +620,111 @@ describe('LocalBackend.callTool', () => {
 
     expect(impactSpy.mock.calls[0][1]).toMatchObject({
       target_uid: 'Function:src/auth.ts:validate',
+    });
+  });
+
+  it('reports UNKNOWN instead of a blast radius when the target resolves without a node id (#3354)', async () => {
+    // Every query returns the same id-less row: the resolver picks it as the
+    // single match, and the frontier query would answer for no symbol at all.
+    (executeParameterized as any).mockResolvedValue([{ name: 'runSweep', type: 'Function' }]);
+
+    const result = await backend.callTool('impact', { target: 'runSweep', direction: 'upstream' });
+
+    expect(result).toMatchObject({
+      target: { name: 'runSweep' },
+      impactedCount: null,
+      risk: 'UNKNOWN',
+    });
+    expect(result.error).toMatch(/without a node id/);
+    expect(result).not.toHaveProperty('byDepthCounts');
+  });
+
+  it.each([[' '], ['']])(
+    'treats a blank target_uid %j as omitted and resolves the name (#3354)',
+    async (targetUid) => {
+      (executeParameterized as any).mockResolvedValue([]);
+
+      const result = await backend.callTool('impact', {
+        target: 'validate',
+        target_uid: targetUid,
+        direction: 'upstream',
+      });
+
+      // Name resolution ran (no rows → not found by NAME), not a lookup of the blank uid.
+      expect(result.error).toBe("Target 'validate' not found");
+      const boundParams = (executeParameterized as any).mock.calls.map((c: unknown[]) => c[2]);
+      expect(boundParams).not.toContainEqual(expect.objectContaining({ uid: expect.anything() }));
+      expect(boundParams).toContainEqual(expect.objectContaining({ symName: 'validate' }));
+    },
+  );
+
+  it('treats a non-string impact target_uid as omitted instead of throwing (#3354)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('impact', {
+      target: 'validate',
+      target_uid: 42,
+      direction: 'upstream',
+    });
+
+    expect(result.error).toBe("Target 'validate' not found");
+    const boundParams = (executeParameterized as any).mock.calls.map((c: unknown[]) => c[2]);
+    expect(boundParams).not.toContainEqual(expect.objectContaining({ uid: expect.anything() }));
+  });
+
+  it.each([[42], [true], [{ id: 'Function:src/auth.ts:validate' }], [['x']]])(
+    'treats a non-string context uid %j as omitted instead of throwing (#3354)',
+    async (uid) => {
+      (executeParameterized as any).mockResolvedValue([]);
+
+      const result = await backend.callTool('context', { name: 'validate', uid });
+
+      expect(result).toEqual({ error: "Symbol 'validate' not found" });
+      const boundParams = (executeParameterized as any).mock.calls.map((c: unknown[]) => c[2]);
+      expect(boundParams).not.toContainEqual(expect.objectContaining({ uid: expect.anything() }));
+    },
+  );
+
+  it('names the unresolved trace source, not a blank from_uid (#3354)', async () => {
+    (executeParameterized as any).mockResolvedValue([]);
+
+    const result = await backend.callTool('trace', {
+      from: 'missingSource',
+      from_uid: ' ',
+      to: 'validate',
+    });
+
+    expect(result).toMatchObject({
+      status: 'not_found',
+      error: "Source symbol 'missingSource' not found.",
+    });
+  });
+
+  it('names the unresolved trace target, not a blank to_uid (#3354)', async () => {
+    const sourceRow = {
+      id: 'Function:src/a.ts:start',
+      name: 'start',
+      type: 'Function',
+      filePath: 'src/a.ts',
+      startLine: 1,
+      endLine: 2,
+    };
+    (executeParameterized as any).mockImplementation(
+      async (_path: string, _query: string, bound: Record<string, unknown> | undefined) =>
+        bound?.uid === sourceRow.id ? [sourceRow] : [],
+    );
+
+    const result = await backend.callTool('trace', {
+      from_uid: sourceRow.id,
+      to: 'missingTarget',
+      to_uid: ' ',
+    });
+    (executeParameterized as any).mockReset();
+    (executeParameterized as any).mockResolvedValue([]);
+
+    expect(result).toMatchObject({
+      status: 'not_found',
+      error: "Target symbol 'missingTarget' not found.",
     });
   });
 
@@ -526,6 +788,12 @@ describe('LocalBackend.callTool', () => {
       `NOT r.reason ENDS WITH '${TYPE_ONLY_IMPORT_REASON_SUFFIX}'`,
     );
     expect(reasonNullAlternativeOf(query)).toContain("r.reason <> 'markdown-link'");
+    // Package-identity edges are IMPORTS metadata for incremental
+    // invalidation. They must be excluded inside this same group, before
+    // LIMIT, or they fill the 100000-row cap on a cycle-free graph.
+    expect(reasonNullAlternativeOf(query)).toContain(
+      `r.reason <> '${DART_PACKAGE_IDENTITY_REASON}'`,
+    );
     expect(query).toContain('LIMIT 100001');
   });
 
@@ -648,6 +916,34 @@ describe('LocalBackend.callTool', () => {
 
     expect(result).toHaveProperty('warning');
     expect((result as any).warning).toMatch(/gitnexus analyze --repair-fts/);
+  });
+
+  it('redacts a space-containing vendor path from the MCP query warning', async () => {
+    const { extensionManager, resetExtensionState } =
+      await import('../../src/core/lbug/extension-loader.js');
+    const spaced = '/tmp/fts vendor/lbug-fts/prebuilds/linux-x64/libfts.lbug_extension';
+    await extensionManager.ensure(
+      vi
+        .fn()
+        .mockRejectedValue(new Error(`Failed to load library '${spaced}': invalid ELF header`)),
+      'fts',
+      'FTS',
+      { policy: 'load-only', vendorRoot: '/tmp/empty-vendor-root' },
+    );
+    const { searchFTSFromLbug } = await import('../../src/core/search/bm25-index.js');
+    vi.mocked(searchFTSFromLbug).mockResolvedValueOnce({ results: [], ftsAvailable: false });
+    (executeParameterized as any).mockResolvedValue([]);
+
+    try {
+      const result = await backend.callTool('query', { query: 'ProcessActivity' });
+      expect(result).toHaveProperty('warning');
+      expect(String((result as { warning?: string }).warning)).toContain('invalid ELF header');
+      expect(String((result as { warning?: string }).warning)).not.toMatch(
+        /fts vendor|\/tmp\/|C:\\Users\\/,
+      );
+    } finally {
+      resetExtensionState();
+    }
   });
 
   it('does not include warning when ftsAvailable is true with zero results', async () => {
@@ -1044,13 +1340,22 @@ describe('LocalBackend.callTool', () => {
     expect(result.error).toContain('Either "name" or "uid"');
   });
 
-  it('context tool returns not-found for missing symbol', async () => {
+  it('context tool returns content availability with a missing symbol', async () => {
     (executeParameterized as any).mockResolvedValue([]);
-    const result = await backend.callTool('context', { name: 'doesNotExist' });
+    const result = await backend.callTool('context', {
+      name: 'doesNotExist',
+      include_content: true,
+    });
     expect(result.error).toContain('not found');
+    expect(result.contentAvailability).toEqual({
+      requested: true,
+      profile: 'full',
+      available: true,
+      scope: 'full',
+    });
   });
 
-  it('context tool returns disambiguation for multiple matches', async () => {
+  it('context tool returns content availability with ambiguous matches', async () => {
     (executeParameterized as any).mockResolvedValue([
       {
         id: 'func:main:1',
@@ -1069,9 +1374,15 @@ describe('LocalBackend.callTool', () => {
         endLine: 5,
       },
     ]);
-    const result = await backend.callTool('context', { name: 'main' });
+    const result = await backend.callTool('context', { name: 'main', include_content: true });
     expect(result.status).toBe('ambiguous');
     expect(result.candidates).toHaveLength(2);
+    expect(result.contentAvailability).toEqual({
+      requested: true,
+      profile: 'full',
+      available: true,
+      scope: 'full',
+    });
 
     // #470: every candidate carries a relevance score in [0, 1] and the list
     // is sorted descending by score (with deterministic tiebreakers).
@@ -1344,10 +1655,65 @@ describe('LocalBackend.callTool', () => {
       await backend.callTool('context', { name: 'src/a.ts:collide', kind: 'Function' });
 
       const parenthesised =
-        /WHERE \(n\.id = \$symName OR n\.name = \$symName\) AND n\.id STARTS WITH \$kindPrefix/;
+        /WHERE \(n\.id = \$symName OR n\.name = \$symName OR \(n\.id STARTS WITH \$filePrefix AND \(n\.filePath = \$symName OR n\.filePath ENDS WITH \$suffix\)\)\) AND n\.id STARTS WITH \$kindPrefix/;
       const calls = resolverCalls();
       expect(calls).toHaveLength(2);
       expect(calls.filter((c) => parenthesised.test(c.query))).toHaveLength(2);
+    });
+
+    it('exact File path wins over suffixed matches during qualified resolution (#3084 review P2)', async () => {
+      (executeParameterized as any).mockImplementation(async (_repo: string, query: string) => {
+        if (query.startsWith('MATCH (n)')) {
+          return [
+            {
+              id: 'File:src/lib/a.ts',
+              name: 'a.ts',
+              filePath: 'src/lib/a.ts',
+              kind: 'File',
+              total_hits: 1,
+            },
+            {
+              id: 'File:lib/a.ts',
+              name: 'a.ts',
+              filePath: 'lib/a.ts',
+              kind: 'File',
+              total_hits: 1,
+            },
+          ];
+        }
+        return [{ total: 2 }];
+      });
+
+      const result = await backend.callTool('context', { name: 'lib/a.ts' });
+      expect(result).toMatchObject({
+        status: 'found',
+        symbol: {
+          filePath: 'lib/a.ts',
+          uid: 'File:lib/a.ts',
+        },
+      });
+    });
+
+    it('not_found impact queries return impactedCount null and risk UNKNOWN across modes (#3074 / #3084 review)', async () => {
+      (executeParameterized as any).mockImplementation(async () => []);
+
+      const cgResult = await backend.callTool('impact', { target: 'nonexistent_target_xyz' });
+      expect(cgResult).toMatchObject({
+        error: "Target 'nonexistent_target_xyz' not found",
+        impactedCount: null,
+        risk: 'UNKNOWN',
+      });
+
+      const pdgResult = await backend.callTool('impact', {
+        target: 'nonexistent_target_xyz',
+        mode: 'pdg',
+      });
+      expect(pdgResult).toMatchObject({
+        error: "Target 'nonexistent_target_xyz' not found",
+        impactedCount: null,
+        risk: 'UNKNOWN',
+        pdgResultVersion: 3,
+      });
     });
 
     it('retries UNFILTERED when the kind hint matches no label prefix (#2787 review F5)', async () => {
@@ -2220,6 +2586,9 @@ describe('LocalBackend.callTool', () => {
         responseKeys: ['data', 'pagination'],
         errorKeys: ['error', 'message'],
         middleware: ['withAuth'],
+        runtimeConfirmed: true,
+        runtimeSource: 'spring-actuator',
+        runtimeStatus: 'runtime-confirmed',
         consumerName: 'GrantsList',
         consumerFile: 'src/GrantsList.tsx',
         fetchReason: 'fetch-url-match|keys:data,pagination',
@@ -2232,6 +2601,11 @@ describe('LocalBackend.callTool', () => {
     expect(result.responseShape.success).toEqual(['data', 'pagination']);
     expect(result.responseShape.error).toEqual(['error', 'message']);
     expect(result).toHaveProperty('middleware', ['withAuth']);
+    expect(result).toHaveProperty('runtimeEvidence', {
+      confirmed: true,
+      source: 'spring-actuator',
+      status: 'runtime-confirmed',
+    });
     expect(result).toHaveProperty('consumers');
     expect(result.consumers).toHaveLength(1);
     expect(result).toHaveProperty('impactSummary');
@@ -2340,6 +2714,9 @@ describe('LocalBackend.callTool', () => {
     responseKeys: null,
     errorKeys: null,
     middleware,
+    runtimeConfirmed: false,
+    runtimeSource: null,
+    runtimeStatus: null,
     consumerName: null,
     consumerFile: null,
     fetchReason: null,
@@ -2358,6 +2735,7 @@ describe('LocalBackend.callTool', () => {
       'GET',
       'POST',
     ]);
+    expect(result.routes[0].runtimeEvidence).toEqual({ confirmed: false });
     expect(result.routes).toMatchObject([{ route: '/api/orders' }, { route: '/api/orders' }]);
   });
 
@@ -2417,6 +2795,20 @@ describe('LocalBackend.callTool', () => {
     expect(result.routes[0].method).toBeNull();
   });
 
+  it('route_map falls back for legacy Route schemas and reports unconfirmed evidence', async () => {
+    vi.mocked(executeParameterized)
+      .mockRejectedValueOnce(
+        new Error('Binder exception: Cannot find property runtimeConfirmed for n.'),
+      )
+      .mockResolvedValueOnce([verbRow('GET', '/legacy', 'LegacyController.java')]);
+
+    const result = await backend.callTool('route_map', { route: '/legacy' });
+
+    // Modern Route query, legacy retry, then the linked-flow batch.
+    expect(executeParameterized).toHaveBeenCalledTimes(3);
+    expect(result.routes[0].runtimeEvidence).toEqual({ confirmed: false });
+  });
+
   it('shape_check surfaces each route method', async () => {
     vi.mocked(executeParameterized).mockResolvedValue([
       {
@@ -2429,6 +2821,7 @@ describe('LocalBackend.callTool', () => {
     ]);
     const result = await backend.callTool('shape_check', { route: '/api/orders' });
     expect(result.routes[0].method).toBe('GET');
+    expect(result.routes[0].runtimeEvidence).toEqual({ confirmed: false });
   });
 
   // The partial-middleware warning is driven by a per-handler verb count taken
@@ -3241,7 +3634,7 @@ describe('LocalBackend impact mode (KTD1/KTD5/KTD12)', () => {
     expect(result.mode).toBe('pdg');
     expect(result.target).toEqual({ name: 'missingSymbol' });
     expect(result.direction).toBe('upstream');
-    expect(result.impactedCount).toBe(0);
+    expect(result.impactedCount).toBeNull();
     expect(result.risk).toBe('UNKNOWN');
   });
 
@@ -3257,7 +3650,7 @@ describe('LocalBackend impact mode (KTD1/KTD5/KTD12)', () => {
     expect(result.mode).toBe('pdg');
     expect(result.target).toEqual({ name: 'main' });
     expect(result.direction).toBe('downstream');
-    expect(result.impactedCount).toBe(0);
+    expect(result.impactedCount).toBeNull();
     expect(result.risk).toBe('UNKNOWN');
     expect(result.suggestion).toMatch(/context/);
     implSpy.mockRestore();
@@ -3326,12 +3719,351 @@ describe('LocalBackend.resolveRepo', () => {
     );
   });
 
-  it('throws for ambiguous repos without param', async () => {
-    setupMultipleRepos();
-    await backend.init();
-    await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
-      'Multiple repositories indexed',
-    );
+  it('throws for ambiguous repos when cwd is outside every indexed path', async () => {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/tmp/test-project-sibling');
+
+    try {
+      setupMultipleRepos();
+      await backend.init();
+      await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
+        'Multiple repositories indexed',
+      );
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('defaults to the deepest indexed repo containing cwd (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-outer-'));
+    const nestedDir = path.join(outerDir, 'packages', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir);
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'outer',
+        path: outerDir,
+        storagePath: path.join(outerDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'nested',
+        path: nestedDir,
+        storagePath: path.join(nestedDir, '.gitnexus'),
+      },
+    ]);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      const resolved = await backend.selectToolRepository(undefined, undefined, {
+        allowCwdDefault: true,
+      });
+      expect(resolved.repoPath).toBe(nestedDir);
+      const explicit = await backend.resolveRepo('outer');
+      expect(explicit.repoPath).toBe(outerDir);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('refreshes before accepting a cached cwd ancestor (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-stale-outer-'));
+    const otherDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-stale-other-'));
+    const nestedDir = path.join(outerDir, 'vendor', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir, otherDir);
+
+    const outerEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'outer',
+      path: outerDir,
+      storagePath: path.join(outerDir, '.gitnexus'),
+    };
+    const nestedEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'nested',
+      path: nestedDir,
+      storagePath: path.join(nestedDir, '.gitnexus'),
+    };
+    const otherEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'other',
+      path: otherDir,
+      storagePath: path.join(otherDir, '.gitnexus'),
+    };
+    (listRegisteredRepos as any)
+      .mockResolvedValueOnce([outerEntry, otherEntry])
+      .mockResolvedValue([outerEntry, nestedEntry, otherEntry]);
+    (getGitRoot as any).mockImplementation((value: string) => {
+      const resolved = path.resolve(value);
+      if (resolved === nestedDir || resolved.startsWith(`${nestedDir}${path.sep}`)) {
+        return nestedDir;
+      }
+      if (resolved === outerDir || resolved.startsWith(`${outerDir}${path.sep}`)) {
+        return outerDir;
+      }
+      if (resolved === otherDir || resolved.startsWith(`${otherDir}${path.sep}`)) {
+        return otherDir;
+      }
+      return null;
+    });
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      const resolved = await backend.selectToolRepository(undefined, undefined, {
+        allowCwdDefault: true,
+      });
+      expect(resolved.repoPath).toBe(nestedDir);
+      expect(listRegisteredRepos).toHaveBeenCalledTimes(2);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('refreshes a cached singleton before repo-less read dispatch (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-singleton-outer-'));
+    const nestedDir = path.join(outerDir, 'packages', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir);
+
+    const outerEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'outer',
+      path: outerDir,
+      storagePath: path.join(outerDir, '.gitnexus'),
+    };
+    const nestedEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'nested',
+      path: nestedDir,
+      storagePath: path.join(nestedDir, '.gitnexus'),
+    };
+    (listRegisteredRepos as any)
+      .mockResolvedValueOnce([outerEntry])
+      .mockResolvedValue([outerEntry, nestedEntry]);
+    (getGitRoot as any).mockReturnValue(outerDir);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      (executeParameterized as any).mockResolvedValue([]);
+
+      await backend.callTool('cypher', { statement: 'MATCH (n) RETURN n LIMIT 1' });
+
+      expect((executeParameterized as any).mock.calls.at(-1)?.[0]).toBe(
+        path.join(nestedDir, '.gitnexus', 'lbug'),
+      );
+      expect(listRegisteredRepos).toHaveBeenCalledTimes(2);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('refreshes a cached singleton before enforcing repo-less rename safety (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-rename-outer-'));
+    const otherDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-rename-other-'));
+    const cwdDir = path.join(outerDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir, otherDir);
+
+    const outerEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'outer',
+      path: outerDir,
+      storagePath: path.join(outerDir, '.gitnexus'),
+    };
+    const otherEntry = {
+      ...MOCK_REPO_ENTRY,
+      name: 'other',
+      path: otherDir,
+      storagePath: path.join(otherDir, '.gitnexus'),
+    };
+    (listRegisteredRepos as any)
+      .mockResolvedValueOnce([outerEntry])
+      .mockResolvedValue([outerEntry, otherEntry]);
+    (getGitRoot as any).mockReturnValue(outerDir);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      await expect(
+        backend.callTool('rename', {
+          symbol_name: 'oldName',
+          new_name: 'newName',
+          dry_run: false,
+        }),
+      ).rejects.toThrow('Multiple repositories indexed');
+      expect(listRegisteredRepos).toHaveBeenCalledTimes(2);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('keeps explicit duplicate aliases on exact git-root disambiguation (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-alias-outer-'));
+    const nestedDir = path.join(outerDir, 'packages', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir);
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'shared',
+        path: outerDir,
+        storagePath: path.join(outerDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'shared',
+        path: nestedDir,
+        storagePath: path.join(nestedDir, '.gitnexus'),
+      },
+    ]);
+    (getGitRoot as any).mockReturnValue(outerDir);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      const resolved = await backend.resolveRepo('shared');
+      expect(resolved.repoPath).toBe(outerDir);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('does not cross a nested git boundary when git root shelling fails (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-rootless-outer-'));
+    const otherDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-rootless-other-'));
+    const nestedDir = path.join(outerDir, 'vendor', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(path.join(nestedDir, '.git'), { recursive: true });
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir, otherDir);
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'outer',
+        path: outerDir,
+        storagePath: path.join(outerDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'other',
+        path: otherDir,
+        storagePath: path.join(otherDir, '.gitnexus'),
+      },
+    ]);
+    (getGitRoot as any).mockReturnValue(null);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      await expect(backend.callTool('query', { query: 'test' })).rejects.toThrow(
+        'Multiple repositories indexed',
+      );
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('keeps cwd routing opt-in for direct backend helpers (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-direct-outer-'));
+    const otherDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-direct-other-'));
+    const cwdDir = path.join(outerDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir, otherDir);
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'outer',
+        path: outerDir,
+        storagePath: path.join(outerDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'other',
+        path: otherDir,
+        storagePath: path.join(otherDir, '.gitnexus'),
+      },
+    ]);
+    (getGitRoot as any).mockReturnValue(outerDir);
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      await expect(backend.queryProcesses()).rejects.toThrow('Multiple repositories indexed');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('does not default across an unindexed nested git boundary (#3073)', async () => {
+    const outerDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-git-outer-'));
+    const otherDir = mkdtempSync(path.join(os.tmpdir(), 'gnx-cwd-git-other-'));
+    const nestedDir = path.join(outerDir, 'vendor', 'nested');
+    const cwdDir = path.join(nestedDir, 'src');
+    mkdirSync(cwdDir, { recursive: true });
+    duplicateFixtureDirs.push(outerDir, otherDir);
+    (listRegisteredRepos as any).mockResolvedValue([
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'outer',
+        path: outerDir,
+        storagePath: path.join(outerDir, '.gitnexus'),
+      },
+      {
+        ...MOCK_REPO_ENTRY,
+        name: 'other',
+        path: otherDir,
+        storagePath: path.join(otherDir, '.gitnexus'),
+      },
+    ]);
+    (getGitRoot as any).mockImplementation((value: string) => {
+      const resolved = path.resolve(value);
+      if (resolved === nestedDir || resolved.startsWith(`${nestedDir}${path.sep}`)) {
+        return nestedDir;
+      }
+      if (resolved === outerDir || resolved.startsWith(`${outerDir}${path.sep}`)) {
+        return outerDir;
+      }
+      if (resolved === otherDir || resolved.startsWith(`${otherDir}${path.sep}`)) {
+        return otherDir;
+      }
+      return null;
+    });
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwdDir);
+
+    try {
+      await backend.init();
+      await expect(
+        backend.selectToolRepository(undefined, undefined, { allowCwdDefault: true }),
+      ).rejects.toThrow('Multiple repositories indexed');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('keeps mutating rename explicit with multiple repos (#3073)', async () => {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/tmp/test-project/src');
+
+    try {
+      setupMultipleRepos();
+      await backend.init();
+      await expect(
+        backend.callTool('rename', {
+          symbol_name: 'oldName',
+          new_name: 'newName',
+          dry_run: true,
+        }),
+      ).rejects.toThrow('Multiple repositories indexed');
+    } finally {
+      cwdSpy.mockRestore();
+    }
   });
 
   it('resolves repo by name parameter', async () => {
@@ -3977,6 +4709,37 @@ describe('LocalBackend.listRepos', () => {
     // listRegisteredRepos called: once in init, once per listRepos
     expect(listRegisteredRepos).toHaveBeenCalledTimes(3);
   });
+
+  // #3256: `unknown` is listing-only (the hot read tools drop it; see
+  // tool-staleness.test.ts), so list_repos is where it must appear. `diverged`
+  // carries its hint and no invented count; `current` carries nothing.
+  it('reports unknown and diverged staleness on the listing (#3256)', async () => {
+    setupSingleRepo();
+    await backend.init();
+    const { checkStalenessAsync } = await import('../../src/core/git-staleness.js');
+    const check = checkStalenessAsync as unknown as ReturnType<typeof vi.fn>;
+    try {
+      check.mockResolvedValue({ isStale: false, commitsBehind: 0, status: 'unknown' });
+      expect((await backend.listRepos())[0].staleness).toEqual({ status: 'unknown' });
+
+      check.mockResolvedValue({
+        isStale: false,
+        commitsBehind: 0,
+        status: 'diverged',
+        hint: 'HEAD moved on',
+      });
+      expect((await backend.listRepos())[0].staleness).toEqual({
+        status: 'diverged',
+        hint: 'HEAD moved on',
+      });
+
+      check.mockResolvedValue({ isStale: false, commitsBehind: 0, status: 'current' });
+      expect((await backend.listRepos())[0].staleness).toBeUndefined();
+    } finally {
+      // The module-level mock is shared; put back the factory's default.
+      check.mockResolvedValue({ isStale: false, commitsBehind: 0 });
+    }
+  });
 });
 
 // ─── list_repos pagination (#2119) ─────────────────────────────────────
@@ -4394,6 +5157,28 @@ describe('LocalBackend.resolveRepo branch scope (#2106)', () => {
     expect(path.basename(handle.lbugPath)).toBe('lbug');
     // The branch handle reports the branch's own commit, not the primary's.
     expect(handle.lastCommit).toBe('featsha');
+    // #3291: the pin's label, not the flat/primary slot — withToolStaleness
+    // copies handle.branch onto the hot-tool payload.
+    expect(handle.branch).toBe('feature/x');
+  });
+
+  it('a pinned-branch tool result names the pin in staleness.branch (#3291)', async () => {
+    // beforeEach clearAllMocks() drops the module-level git-staleness factory
+    // impl; restore a resolving current so withToolStaleness attaches the ref.
+    const { checkStalenessAsync } = await import('../../src/core/git-staleness.js');
+    (checkStalenessAsync as any).mockResolvedValue({
+      isStale: false,
+      commitsBehind: 0,
+      status: 'current',
+    });
+    vi.spyOn(backend as any, 'impact').mockResolvedValue({ ok: true });
+    const result = (await backend.callTool('impact', {
+      target: 'doWork',
+      repo: 'multi',
+      branch: 'feature/x',
+    })) as { staleness: { branch?: string; lastCommit?: string } };
+    expect(result.staleness.branch).toBe('feature/x');
+    expect(result.staleness.lastCommit).toBe('featsha');
   });
 
   it('an un-indexed branch throws a clear error', async () => {
@@ -4627,7 +5412,7 @@ describe('LocalBackend tool-staleness cache keying (#2655 review)', () => {
       lbugPath: `/r/.gitnexus/${path.join('branches', 'x', 'lbug')}`,
       lastCommit: 'BRANCHSHA',
     };
-    vi.spyOn(backend, 'resolveRepo')
+    vi.spyOn(backend, 'selectToolRepository')
       .mockResolvedValueOnce(flat as any)
       .mockResolvedValueOnce(branch as any);
     // The tool itself returns a plain (staleness-carryable) object.
@@ -4649,11 +5434,20 @@ describe('LocalBackend tool-staleness cache keying (#2655 review)', () => {
       branch: 'x',
     });
 
-    // Flat index (lastCommit=FLATSHA) is 5 behind -> field present.
-    expect(flatRes).toMatchObject({ staleness: { commitsBehind: 5 } });
-    // Branch index (different lbugPath + lastCommit) is current; it must NOT
-    // inherit the flat handle's cached staleness (the pre-fix repoPath-keyed bug).
-    expect(branchRes).not.toHaveProperty('staleness');
+    // Flat index (lastCommit=FLATSHA) is 5 behind -> counted gap reported.
+    expect(flatRes).toMatchObject({
+      staleness: { status: 'behind', commitsBehind: 5, lastCommit: 'FLATSHA' },
+    });
+    // Branch index (different lbugPath + lastCommit) is current. Since #3291 the
+    // field rides on every response, so absence can no longer be the proof; what
+    // shows the flat handle's cached entry was NOT reused (the pre-fix
+    // repoPath-keyed bug) is that this one reports its OWN commit and its own
+    // status, with no trace of the flat handle's counted gap.
+    expect(branchRes).toMatchObject({
+      staleness: { status: 'current', lastCommit: 'BRANCHSHA' },
+    });
+    const branchStaleness = (branchRes as { staleness: { commitsBehind?: number } }).staleness;
+    expect(branchStaleness.commitsBehind).toBeUndefined();
   });
 });
 
@@ -4681,7 +5475,8 @@ describe('LocalBackend tool-staleness signal (#2655 review)', () => {
     lastCommit: 'HEADSHA',
   };
 
-  const stubResolve = () => vi.spyOn(backend, 'resolveRepo').mockResolvedValue(handle as any);
+  const stubResolve = () =>
+    vi.spyOn(backend, 'selectToolRepository').mockResolvedValue(handle as any);
 
   const stubStale = async () => {
     const { checkStalenessAsync } = await import('../../src/core/git-staleness.js');

@@ -137,7 +137,7 @@ describe('buildPhaseList under streamGraphEmit', () => {
 });
 
 describe('RETAINED_REL_TYPES tracks its readers', () => {
-  it('streams write-only conditional and declaration evidence', () => {
+  it('streams Actuator relationship types that no later phase reads', () => {
     expect(RETAINED_REL_TYPES.has('CONDITIONAL_ON')).toBe(false);
     expect(RETAINED_REL_TYPES.has('DECLARES')).toBe(false);
   });
@@ -168,6 +168,10 @@ describe('RETAINED_REL_TYPES tracks its readers', () => {
     // CALLS is read by taintSummaries, which is exactly why the sink answers a
     // COMPLETE read instead of retaining it — so it is a known exemption.
     readTypes.delete('CALLS');
+    // Dart package invalidation reads IMPORTS endpoints through the sink's
+    // complete typed iterator. dart-package-dependencies.test.ts exercises
+    // transitive closure and idempotence with actual streamed IMPORTS rows.
+    readTypes.delete('IMPORTS');
 
     const missing = [...readTypes].filter((t) => !RETAINED_REL_TYPES.has(t as RelationshipType));
     expect(missing).toEqual([]);

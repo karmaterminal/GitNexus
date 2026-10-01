@@ -41,6 +41,9 @@ import { decodeMarker } from '../../utils/heritage-marker.js';
 import { typeApplicationArguments } from '../../utils/template-arguments.js';
 import type { HeritageTypeArgumentSink } from '../../scope-resolution/utils/generic-instantiation.js';
 import { expandDartWildcardNames } from './expand-wildcards.js';
+import { dartIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { loadDartPackageConfig } from './package-config.js';
+import { emitDartPackageDependencies } from './package-dependencies.js';
 
 interface ClassDefRef {
   readonly graphId: string;
@@ -198,8 +201,13 @@ export const dartScopeResolver: ScopeResolver = {
   languageProvider: dartProvider,
   importEdgeReason: 'dart-scope: import',
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths) =>
-    resolveDartImportTarget(targetRaw, fromFile, allFilePaths),
+  loadResolutionConfig: loadDartPackageConfig,
+  // Package dependencies use cached ParsedFile facts, never raw source text.
+  postExtractSourceTextPolicy: 'uncached-files',
+  emitPostResolutionEdges: (graph, parsedFiles, _nodeLookup, _indexes, ctx) =>
+    emitDartPackageDependencies(graph, parsedFiles, ctx.resolutionConfig),
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) =>
+    resolveDartImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
 
   // Dart `import` is whole-library: every public top-level symbol of the
   // target enters scope. Enumerating them lets `propagateImportedReturnTypes`
@@ -233,5 +241,6 @@ export const dartScopeResolver: ScopeResolver = {
   // No `new`: bare `Foo()` resolves to the type; with cross-file imports the
   // callee is reachable workspace-wide.
   allowGlobalFreeCallFallback: true,
+  isGlobalNameFallbackPlausible: dartIsGlobalNameFallbackPlausible,
   constructorCallTargetsClass: true,
 };

@@ -4,6 +4,7 @@ import type { Command } from 'commander';
 import type { RegistryWriteOutcome } from '../core/group/sync.js';
 import type { MatchType } from '../core/group/types.js';
 import { logger } from '../core/logger.js';
+import { formatIndexStatusCell } from './group-status-format.js';
 
 const _require = createRequire(import.meta.url);
 const yaml = _require('js-yaml') as typeof import('js-yaml');
@@ -161,9 +162,7 @@ export function registerGroupCommands(program: Command): void {
             console.log(`  ${repoPath.padEnd(25)} MISSING   (no entry in the registry)`);
             continue;
           }
-          const idx = row.indexStale
-            ? `STALE     (${row.commitsBehind ?? '?'} commits behind)`
-            : 'OK        ';
+          const idx = formatIndexStatusCell(row);
           const ctr = row.contractsStale ? ' CONTRACTS_STALE' : '';
           console.log(`  ${repoPath.padEnd(25)} ${idx}${ctr}`);
         }
@@ -219,8 +218,9 @@ export function registerGroupCommands(program: Command): void {
     .action(async (name: string, opts: Record<string, boolean | undefined>) => {
       const { getGroupDir, getDefaultGitnexusDir } = await import('../core/group/storage.js');
       const { loadGroupConfig } = await import('../core/group/config-parser.js');
-      const { syncGroup } = await import('../core/group/sync.js');
+      const { syncGroup, formatGroupSyncAmbiguousError } = await import('../core/group/sync.js');
       const { GroupSyncLockError } = await import('../core/group/group-lock.js');
+      const { RegistryAmbiguousTargetError } = await import('../storage/repo-manager.js');
 
       const groupDir = getGroupDir(getDefaultGitnexusDir(), name);
       const config = await loadGroupConfig(groupDir);
@@ -235,6 +235,11 @@ export function registerGroupCommands(program: Command): void {
           exactOnly: Boolean(opts.exactOnly),
         });
       } catch (err) {
+        if (err instanceof RegistryAmbiguousTargetError) {
+          logger.error(`⚠️ Did not sync group "${name}": ${formatGroupSyncAmbiguousError(err)}`);
+          process.exitCode = 1;
+          return;
+        }
         // A sync that could not take the group's lock did NOT run and wrote
         // nothing (R9 fails closed). That is an operator-actionable outcome, not
         // a crash, so report it as a failed command rather than letting it
