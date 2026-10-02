@@ -144,6 +144,8 @@ export const en = {
   // `changed_count` was summed from the batches that SUCCEEDED, so it is a floor.
   'tool.detectChanges.truncatedDegraded':
     'LISTING CAPPED: the changed-symbol list was capped. The run also degraded, so the counts are a lower bound, not a total.',
+  'tool.detectChanges.noMergeBase':
+    'NO MERGE BASE: could not find where HEAD branched from "{{ref}}", so this diff is against "{{ref}}" itself and also lists changes made on "{{ref}}" since then.',
   'tool.detectChanges.changesSummary': 'Changes: {{files}} files, {{symbols}} symbols',
   'tool.detectChanges.affectedProcesses': 'Affected processes: {{count}}',
   'tool.detectChanges.riskLevel': 'Risk level: {{risk}}',

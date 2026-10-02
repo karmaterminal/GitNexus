@@ -133,6 +133,8 @@ export const zhCN = {
     '列表已截断：已变更符号列表被截断，未列出全部变更符号。计数与风险等级仍涵盖全部符号。',
   'tool.detectChanges.truncatedDegraded':
     '列表已截断：已变更符号列表被截断。本次运行同时不完整，因此计数为下限而非总数。',
+  'tool.detectChanges.noMergeBase':
+    '无合并基点：找不到 HEAD 从 "{{ref}}" 分出的位置，因此本次 diff 直接对比 "{{ref}}"，也会列出 "{{ref}}" 此后的变更。',
   'tool.detectChanges.changesSummary': '变更：{{files}} 个文件，{{symbols}} 个符号',
   'tool.detectChanges.affectedProcesses': '受影响流程：{{count}}',
   'tool.detectChanges.riskLevel': '风险等级：{{risk}}',

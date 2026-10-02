@@ -1207,6 +1207,12 @@ export function resolveWorktreeCwd(repoPath: string, launchCwd: string): string 
  */
 const DETECT_CHANGES_MAX_LISTED_SYMBOLS = 1000;
 
+/**
+ * Member-method names that are constructors in languages whose `new Foo()` /
+ * `Foo()` is recorded as a CALLS edge to the class rather than to the method.
+ */
+const CONSTRUCTOR_METHOD_NAMES = new Set(['constructor', '__init__']);
+
 /** One row of the `detect_changes` hunk→symbol query (see `detectChanges`). */
 interface ChangedSymbolRow {
   diffPath: string;
@@ -1269,6 +1275,38 @@ export function buildDetectChangesDiffArgs(scope: string, baseRef?: string): str
     case 'unstaged':
     default:
       return [...args, '-U0'];
+  }
+}
+
+/**
+ * The merge base of `baseRef` and HEAD, for `detect_changes` compare scope.
+ *
+ * Never throws: an unknown ref, unrelated histories or a shallow clone that
+ * stops short of the branch point come back as `{ reason }`, and the caller
+ * falls back to diffing against `baseRef` itself with a visible warning. A ref
+ * that starts with `-` is refused here rather than handed to git as an option.
+ */
+export function resolveCompareMergeBase(
+  execFileSync: (cmd: string, args: string[], opts: object) => string | Buffer,
+  cwd: string,
+  baseRef: string,
+): { sha: string; reason?: undefined } | { sha?: undefined; reason: string } {
+  if (baseRef.startsWith('-')) return { reason: 'base_ref must not start with "-"' };
+  try {
+    const out = String(
+      execFileSync('git', ['merge-base', baseRef, 'HEAD'], {
+        cwd,
+        encoding: 'utf-8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }),
+    ).trim();
+    return /^[0-9a-f]{40,64}$/.test(out)
+      ? { sha: out }
+      : { reason: 'git merge-base printed no commit' };
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? '').trim();
+    return { reason: stderr || 'git merge-base failed' };
   }
 }
 
@@ -6221,8 +6259,14 @@ export class LocalBackend {
 
     // Ignore CR-only EOL differences, while preserving meaningful whitespace changes.
     // execFileSync receives an argv array, so refs never pass through a shell.
-    const diffArgs = buildDetectChangesDiffArgs(scope, params.base_ref);
+    let diffArgs = buildDetectChangesDiffArgs(scope, params.base_ref);
     if (!diffArgs) return { error: 'base_ref is required for "compare" scope' };
+    // `compare` diffs the working tree against the merge base of `base_ref` and
+    // HEAD, not against `base_ref` itself: once the base branch moves on, a
+    // plain `git diff main` also reports every commit landed on main since the
+    // branch point (as reverted lines), so a PR's change set picks up symbols it
+    // never touched. Echoed back so the caller can see which commit was used.
+    let compareBase: { base_ref: string; merge_base?: string; warning?: string } | undefined;
 
     let diffOutput: string;
     try {
@@ -6266,6 +6310,19 @@ export class LocalBackend {
         diffCwd = providedResolved;
       }
 
+      if (scope === 'compare' && params.base_ref) {
+        const mergeBase = resolveCompareMergeBase(execFileSync, diffCwd, params.base_ref);
+        if (mergeBase.sha) {
+          diffArgs = buildDetectChangesDiffArgs(scope, mergeBase.sha) ?? diffArgs;
+          compareBase = { base_ref: params.base_ref, merge_base: mergeBase.sha };
+        } else {
+          compareBase = {
+            base_ref: params.base_ref,
+            warning: `Could not find a merge base of "${params.base_ref}" and HEAD (${mergeBase.reason}); diffed against "${params.base_ref}" directly, so commits on it since the branch point show up as changes.`,
+          };
+        }
+      }
+
       // maxBuffer raised from Node's 1MB default to 256MB to avoid ENOBUFS on
       // repos with large unstaged/untracked diffs (e.g. unignored build folders).
       // See issue: spawnSync git ENOBUFS in detect_changes(scope="unstaged").
@@ -6298,6 +6355,7 @@ export class LocalBackend {
         },
         changed_symbols: [],
         affected_processes: [],
+        ...(compareBase && { compare_base: compareBase }),
         ...(parseFailed && { partial: true }),
       };
     }
@@ -6565,6 +6623,7 @@ export class LocalBackend {
       },
       changed_symbols: listedSymbols,
       affected_processes: Array.from(affectedProcesses.values()),
+      ...(compareBase && { compare_base: compareBase }),
       // A swallowed query failure makes the counts/risk above incomplete — tell
       // the caller so the safety gate isn't trusted as a clean result (#2283).
       ...(queryDegraded && { partial: true }),
@@ -8271,6 +8330,60 @@ export class LocalBackend {
       }
     }
 
+    // A constructor modelled as a member Method (JS/TS `constructor`, Python
+    // `__init__`) has no incoming CALLS of its own: `new Foo()` / `Foo()` is
+    // recorded as a CALLS edge to the owning CLASS. Without this, upstream
+    // impact on the constructor resolved zero callers even though every
+    // instantiation site depends on it. Fold the class's CALLS callers in as
+    // depth-1 dependents so the walk continues from them (#480 is the reverse
+    // case: a Class target seeded with its Constructor nodes).
+    const constructorCallerFrontier: string[] = [];
+    if (
+      direction === 'upstream' &&
+      (symType === 'Constructor' ||
+        (symType === 'Method' && CONSTRUCTOR_METHOD_NAMES.has(String(sym.name ?? sym[1] ?? '')))) &&
+      relationTypes.includes('CALLS')
+    ) {
+      try {
+        const rows = await executeParameterized(
+          repo.lbugPath,
+          `
+          MATCH (caller)-[r:CodeRelation]->(cls)-[hm:CodeRelation]->(ctor)
+          WHERE ctor.id = $symId AND hm.type = 'HAS_METHOD' AND r.type = 'CALLS'
+          RETURN caller.id AS id, caller.name AS name, labels(caller)[0] AS type,
+                 caller.filePath AS filePath, r.confidence AS confidence
+        `,
+          { symId },
+        );
+        rows.sort((a, b) => compareCodeUnits(String(a.id ?? a[0]), String(b.id ?? b[0])));
+        for (const row of rows) {
+          const callerId = row.id || row[0];
+          const filePath = row.filePath || row[3] || '';
+          if (!callerId || visited.has(callerId)) continue;
+          if (!includeTests && isTestFilePath(filePath)) continue;
+          const storedConfidence = row.confidence ?? row[4];
+          if (safeMinConfidence > 0 && !(storedConfidence >= safeMinConfidence)) continue;
+          visited.add(callerId);
+          constructorCallerFrontier.push(callerId);
+          impacted.push({
+            depth: 1,
+            id: callerId,
+            name: row.name || row[1],
+            type: row.type || row[2],
+            filePath,
+            relationType: 'CALLS',
+            confidence:
+              typeof storedConfidence === 'number' && storedConfidence > 0
+                ? storedConfidence
+                : confidenceForRelType('CALLS'),
+          });
+        }
+      } catch (e) {
+        logQueryError('impact:constructor-class-callers', e);
+        traversalComplete = false;
+      }
+    }
+
     for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
       const nextFrontier: string[] = [];
 
@@ -8429,8 +8542,8 @@ export class LocalBackend {
       }
 
       frontier =
-        depth === 1 && objectCallableFrontier.length > 0
-          ? [...new Set([...nextFrontier, ...objectCallableFrontier])]
+        depth === 1 && (objectCallableFrontier.length > 0 || constructorCallerFrontier.length > 0)
+          ? [...new Set([...nextFrontier, ...objectCallableFrontier, ...constructorCallerFrontier])]
           : nextFrontier;
     }
 
