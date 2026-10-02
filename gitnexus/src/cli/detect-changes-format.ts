@@ -29,6 +29,7 @@ type DetectChangesResult = {
   error?: unknown;
   partial?: boolean;
   truncated?: boolean;
+  compare_base?: { base_ref?: string; merge_base?: string; warning?: string };
   summary?: DetectChangesSummary;
   changed_symbols?: ChangedSymbol[];
   affected_processes?: AffectedProcess[];
@@ -50,6 +51,10 @@ export function formatDetectChangesResult(result: unknown): string {
   // The plain truncation note reassures that the counts are whole. That is only
   // true when the run did NOT also degrade — `changed_count` sums the batches
   // that succeeded — so the two flags together get a different sentence.
+  // `compare` without a merge base diffs against the base ref's tip, which
+  // also counts every commit landed there since the branch point.
+  if (payload.compare_base?.warning)
+    notes.push(t('tool.detectChanges.noMergeBase', { ref: payload.compare_base.base_ref ?? '' }));
   if (payload.truncated)
     notes.push(
       t(payload.partial ? 'tool.detectChanges.truncatedDegraded' : 'tool.detectChanges.truncated'),

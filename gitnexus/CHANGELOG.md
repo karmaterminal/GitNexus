@@ -6,8 +6,13 @@ All notable changes to GitNexus will be documented in this file.
 
 ### Changed
 
+- **`detect_changes` compare scope diffs against the merge base of `base_ref` and HEAD** — once the base branch moved on, `git diff main` also counted every commit landed on main since the branch point, so a branch's change set picked up symbols it never touched. The result carries `compare_base: { base_ref, merge_base }`; with no merge base (unrelated histories, a shallow clone that stops short) it falls back to the tip and says so in `compare_base.warning`, and the CLI prints a `NO MERGE BASE` note
 - **MCP `query` / `context` / `impact` / `cypher` always attach a ref-carrying `staleness` field** — object results include it even when `status` is `current`. Absence is no longer the freshness signal: read `staleness.status` (`behind`/`diverged` vs `current`/`unknown`) and `branch`/`lastCommit` for which index answered. `list_repos` and the HTTP repo routes are unchanged (still omit `staleness` when current; the ref is top-level) (#3291, #3293)
 - **MCP `query` keeps one `process_symbols` row per `(id, process_id)`** — a symbol in more than one execution flow stays on each process card, and `symbol_count` is the number of those emitted rows after `max_symbols`. A `repo` of `@<group>` returns `{ group, query, results, per_repo }` and does not include `process_symbols`; `results[].symbol_count` is that member's post-slice count, and a `service` prefix counts only attaches under the prefix. Query `@<group>/<memberPath>` for that member's attach rows (#3351)
+
+### Fixed
+
+- **Upstream `impact` on a member-method constructor (JS/TS `constructor`, Python `__init__`) reports instantiation sites** — `new Foo()` / `Foo()` is a CALLS edge to the class, so the constructor itself resolved zero callers and read UNKNOWN. The class's CALLS callers are now its depth-1 dependents and the walk continues from them
 
 ## [1.6.12] - 2026-09-12
 

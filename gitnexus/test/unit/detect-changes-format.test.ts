@@ -90,3 +90,30 @@ describe('formatDetectChangesResult — zero-symbol honesty (#3131)', () => {
     expect(text).not.toContain('No changes detected.');
   });
 });
+
+describe('formatDetectChangesResult — compare without a merge base', () => {
+  beforeEach(() => {
+    setCliLanguage('en');
+  });
+
+  afterEach(() => {
+    setCliLanguage(null);
+  });
+
+  it('leads with a note when compare fell back to the base ref tip', () => {
+    const text = formatDetectChangesResult({
+      compare_base: { base_ref: 'main', warning: 'no merge base' },
+      summary: { changed_count: 0, affected_count: 0, risk_level: 'none' },
+    });
+    expect(text.split('\n')[0]).toContain('NO MERGE BASE');
+    expect(text).toContain('"main"');
+  });
+
+  it('adds no note when a merge base was found', () => {
+    const text = formatDetectChangesResult({
+      compare_base: { base_ref: 'main', merge_base: 'a'.repeat(40) },
+      summary: { changed_count: 0, affected_count: 0, risk_level: 'none' },
+    });
+    expect(text).not.toContain('NO MERGE BASE');
+  });
+});
