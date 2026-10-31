@@ -43,6 +43,15 @@ export type ContentRetention = 'full' | 'symbol' | 'none';
 export type FtsProfile = 'full' | 'symbol-no-file-content' | 'name-only';
 export const CONTENT_RETENTION_SCHEMA_VERSION = 1;
 
+/** Exact staged generation whose completed embedding groups can survive a retry. */
+export interface EmbeddingRecoveryReference {
+  /** A run-minted basename within this metadata file's index slot. */
+  stagingFile: string;
+  schemaFingerprint: string;
+  /** Active-window and inherited incomplete groups: never reusable until completed. */
+  unsafeNodeIds: string[];
+}
+
 /**
  * Versioned receipt for the analyzer process that produced an index.
  *
@@ -151,6 +160,13 @@ export interface RepoMeta {
    * matches the currently invoked analyzer.
    */
   runnerIdentity?: AnalyzerRunnerIdentity;
+  /** Parser artifacts and extraction options that produced the successful graph.
+   * Missing provenance never authorizes reuse. FTS-only repair preserves it.
+   */
+  parseCacheIdentity?: {
+    base: string;
+    pdg?: { identity: string; maxFunctionLines: number };
+  };
   /**
    * Canonical `origin` remote URL captured at index time. Used to
    * fingerprint the same logical repo across multiple on-disk clones
@@ -382,6 +398,11 @@ export interface RepoMeta {
    */
   indexCoverage?: {
     maxFileSizeBytes: number;
+    /**
+     * Dot directories indexed via `GITNEXUS_INCLUDE_DOT_DIRS`. Absent means
+     * none: the index predates the option or was built without it.
+     */
+    includeDotDirs?: string[];
     dirtyPaths?: string[];
   };
   /**
@@ -521,6 +542,11 @@ export interface RepoMeta {
      * subset of their chunks; for `'partial'` they hold none.
      */
     pendingNodeIds?: string[];
+    /**
+     * Interrupted atomic builds only. This does not publish the staged graph
+     * or advance live embedding statistics; it identifies a recovery source.
+     */
+    recovery?: EmbeddingRecoveryReference;
   };
   /**
    * Name of the git branch this index represents (#2106). Absent for the

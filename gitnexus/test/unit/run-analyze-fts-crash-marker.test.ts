@@ -22,6 +22,7 @@ import { ANALYSIS_FEATURES } from '../../src/core/analysis-feature-registry.js';
 import { resolveAnalysisFeatureVersions } from '../../src/core/analysis-features.js';
 import { createKnowledgeGraph } from '../../src/core/graph/graph.js';
 import { resolveAnalyzerRunnerIdentity } from '../../src/core/analyzer-identity.js';
+import { resolveParseCacheIdentity } from '../../src/core/parse-cache-identity.js';
 import { EMBEDDING_DIMS, SCHEMA_FINGERPRINT } from '../../src/core/lbug/schema.js';
 import {
   PROCESS_DETECTION_BUDGET_DEFAULTS,
@@ -67,18 +68,24 @@ const seedGitFile = async (repoPath: string): Promise<void> => {
   });
 };
 
-const incrementalMeta = (repoPath: string): RepoMeta => ({
-  repoPath,
-  lastCommit: 'stale-not-head',
-  indexedAt: new Date().toISOString(),
-  stats: {},
-  fileHashes: { [REL_FILE]: 'stale-hash' },
-  schemaFingerprint: SCHEMA_FINGERPRINT,
-  analysisFeatures: resolveAnalysisFeatureVersions(ANALYSIS_FEATURES, [REL_FILE]),
-  cjkSegmentation: getSearchFTSCjkSegmentation(),
-  embeddingDims: EMBEDDING_DIMS,
-  runnerIdentity: resolveAnalyzerRunnerIdentity(RUN_ANALYZE_URL.href),
-});
+const incrementalMeta = (repoPath: string): RepoMeta => {
+  const parser = resolveParseCacheIdentity(RUN_ANALYZE_URL.href);
+  if (parser.ok === false)
+    throw new Error(`Cannot verify fixture parser artifacts: ${parser.reason}`);
+  return {
+    repoPath,
+    lastCommit: 'stale-not-head',
+    indexedAt: new Date().toISOString(),
+    stats: {},
+    fileHashes: { [REL_FILE]: 'stale-hash' },
+    schemaFingerprint: SCHEMA_FINGERPRINT,
+    analysisFeatures: resolveAnalysisFeatureVersions(ANALYSIS_FEATURES, [REL_FILE]),
+    cjkSegmentation: getSearchFTSCjkSegmentation(),
+    embeddingDims: EMBEDDING_DIMS,
+    runnerIdentity: resolveAnalyzerRunnerIdentity(RUN_ANALYZE_URL.href),
+    parseCacheIdentity: { base: parser.identity.base },
+  };
+};
 
 const headCommit = (repoPath: string): string =>
   execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf8' }).trim();
@@ -99,7 +106,7 @@ const fileGraph = () => {
   graph.addNode({
     id: 'file:src/a.ts',
     label: 'File',
-    properties: { filePath: REL_FILE },
+    properties: { name: REL_FILE, filePath: REL_FILE },
   });
   return graph;
 };
@@ -113,7 +120,13 @@ const mockLbugAdapter = async () => {
     initLbug: vi.fn(async () => undefined),
     loadGraphToLbug: vi.fn(async () => undefined),
     getLbugStats: vi.fn(async () => ({ nodes: 1, edges: 0, communities: 0, processes: 0 })),
-    executeQuery: vi.fn(async () => []),
+    // The policy fixture has one stored File row. Publication now reconciles
+    // that identity instead of trusting the synthetic node count alone.
+    executeQuery: vi.fn(async (query: string) =>
+      query.startsWith('MATCH (n:`File`) RETURN n.id AS id')
+        ? [{ id: 'file:src/a.ts', name: REL_FILE, filePath: REL_FILE }]
+        : [],
+    ),
     executeWithReusedStatement: vi.fn(async () => []),
     closeLbug: vi.fn(async () => undefined),
     wipeLbugDbFiles: vi.fn(async () => undefined),
@@ -1011,9 +1024,12 @@ describe('runFullAnalysis FTS crash marker', () => {
   );
 
   it('treats a boundary checkpoint failure as best-effort on an in-place plan', async () => {
-    const checkpointOnce = vi.fn(async () => {
-      throw new Error('checkpoint rename failed');
-    });
+    // Only the earlier boundary is best-effort. Publication still requires
+    // its own successful checkpoint through the same policy helper.
+    const checkpointOnce = vi
+      .fn<() => Promise<boolean>>()
+      .mockRejectedValueOnce(new Error('checkpoint rename failed'))
+      .mockResolvedValue(true);
     let stamped: RepoMeta['incrementalInProgress'];
     vi.doMock('../../src/core/lbug/wal-checkpoint-driver.js', async (importActual) => ({
       ...(await importActual<typeof import('../../src/core/lbug/wal-checkpoint-driver.js')>()),
@@ -1060,6 +1076,7 @@ describe('runFullAnalysis FTS crash marker', () => {
         { onProgress: () => {}, onLog: () => {} },
       );
       expect(result.ftsSkipped).not.toBe(true);
+      expect(checkpointOnce).toHaveBeenCalledTimes(2);
       expect(stamped).toMatchObject({
         phase: FTS_DIRTY_PHASE,
         writePlan: 'in-place',
