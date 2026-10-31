@@ -1404,6 +1404,8 @@ export function resolveCompareMergeBase(
       execFileSync('git', ['merge-base', baseRef, 'HEAD'], {
         cwd,
         encoding: 'utf-8',
+        // One SHA line; explicit like every capturing call here (local-backend-maxbuffer.test.ts).
+        maxBuffer: 1024 * 1024,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       }),
