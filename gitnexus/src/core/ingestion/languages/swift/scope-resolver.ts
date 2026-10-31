@@ -56,6 +56,11 @@ import { resolveDefGraphId } from '../../scope-resolution/graph-bridge/ids.js';
 import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import type { KnowledgeGraph } from '../../../graph/types.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import {
+  canonicalizeWorkspaceBindings,
+  canonicalModuleExports,
+} from '../../scope-resolution/scope/canonicalize-bindings.js';
+import { canonicalName } from './identifiers.js';
 import { swiftProvider } from '../swift.js';
 import {
   swiftArityCompatibility,
@@ -70,10 +75,14 @@ import {
 import { stripSwiftTypePreservingDecoration } from './interpret.js';
 import { groupSwiftFilesByModule } from './target-grouping.js';
 import { swiftIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { swiftIsCallableVisibleFromCaller } from './callable-visibility.js';
 
 const ZERO_RANGE = { startLine: 0, startCol: 0, endLine: 0, endCol: 0 } as const;
 
 const swiftScopeResolver: ScopeResolver = {
+  moduleExports: (parsed) => canonicalModuleExports(parsed, canonicalName),
+  populateWorkspaceReferences: (parsedFiles) =>
+    canonicalizeWorkspaceBindings(parsedFiles, canonicalName),
   language: SupportedLanguages.Swift,
   languageProvider: swiftProvider,
   importEdgeReason: 'swift-scope: import',
@@ -148,6 +157,19 @@ const swiftScopeResolver: ScopeResolver = {
   fieldFallbackOnMethodLookup: false,
   propagatesReturnTypesAcrossImports: true,
 
+  // `swiftBindingScopeFor` hoists every method's return-type binding out of
+  // its class body onto the Module scope (as C# does), so the receiver fold
+  // must walk up there to type `svc.getUser().save()`. Those bindings are
+  // keyed by bare name, so the walk only accepts one a member of the
+  // receiver's own class declared: a same-named method of another class in
+  // the file, or an imported top-level function, must not answer.
+  hoistTypeBindingsToModule: true,
+  hoistedTypeBindingsRequireOwner: true,
+
+  // Unqualified methods need a reachable owner; retain the full lexical
+  // candidate set so the shared resolver also narrows free overloads by arity.
+  freeCallsRequireInstanceOwnership: true,
+
   // Swift has no `new` keyword: `UserService()` is a bare call that
   // resolves to the type's Constructor/Class. With whole-module sibling
   // visibility, the callee is reachable workspace-wide, so allow the
@@ -155,6 +177,7 @@ const swiftScopeResolver: ScopeResolver = {
   // no-`new` constructor + cross-file free-call shape).
   allowGlobalFreeCallFallback: true,
   isGlobalNameFallbackPlausible: swiftIsGlobalNameFallbackPlausible,
+  isCallableVisibleFromCaller: swiftIsCallableVisibleFromCaller,
 
   // Swift's call graph models `Type(...)` as a reference to the type
   // itself, not its `init` — both the legacy DAG and this test suite link
