@@ -11,8 +11,8 @@
  * reports a blast radius into code that cannot be affected. The reporter
  * measured 44 of 74 cross-package edges landing on two such files.
  *
- * The mechanism is shared, which is why this file is: `import-resolvers/
- * utils.ts:suffixResolve` asks "does any file in this repo have a path ending
+ * The shared `utils/suffix-index.ts:suffixResolve` helper asks
+ * "does any file in this repo have a path ending
  * in this specifier?", retrying with each leading segment dropped, and most
  * languages still end their resolution chain there.
  *
@@ -48,11 +48,16 @@ import {
   clearKotlinPackageFacts,
   setKotlinPackageFact,
 } from '../../../src/core/ingestion/languages/kotlin/package-facts.js';
+import type { GoWorkspaceConfig } from '../../../src/core/ingestion/languages/go/workspace-config.js';
 
 /** The `composer.json` PSR-4 map `loadPhpComposerConfig` would have produced. */
 const PHP_COMPOSER: ComposerConfig = { psr4: new Map([['App', 'app']]) };
-/** The value `loadGoModulePath` produces for a repo with a `go.mod`. */
-const GO_MODULE = { modulePath: 'example.com/mod' };
+/** The value `captureGoWorkspaceConfig` produces for a repo whose only
+ *  `go.mod` is at its root. */
+const GO_MODULE: GoWorkspaceConfig = {
+  modules: [{ modulePath: 'example.com/mod', dir: '' }],
+  workFiles: [],
+};
 /** The root dependency scope `loadRubyResolutionConfig` would have produced. */
 const RUBY_GEMS = {
   scopesByDirectory: new Map([
@@ -413,6 +418,21 @@ const CASES: ReadonlyMap<SupportedLanguages, ConformanceCase> = new Map([
     },
   ],
   [
+    SupportedLanguages.R,
+    {
+      files: ['scripts/main.R', 'vendor/ggplot2.R', 'vendor/ggplot2.py', 'pkgA/R/utils.R'],
+      fromFile: 'scripts/main.R',
+      resolutionConfig: undefined,
+      external: 'ggplot2',
+      decoy: 'vendor/ggplot2.R',
+      reachesDecoy: '"ggplot2.R"',
+      parsedImport: (targetRaw) =>
+        targetRaw === 'ggplot2'
+          ? { kind: 'wildcard', targetRaw }
+          : { kind: 'side-effect', targetRaw },
+    },
+  ],
+  [
     SupportedLanguages.ObjectiveC,
     {
       files: ['Headers/Foundation.h', 'Headers/Widget.h', 'Sources/main.m'],
@@ -541,4 +561,35 @@ describe('external imports never resolve into the repository (#2953)', () => {
       `${language}: '${testCase.external}' names nothing in this repo, but resolved to ${JSON.stringify(resolved)}`,
     ).toEqual([]);
   });
+  // R's NAMESPACE `importFrom(ggplot2, geom)` is a `named` import (the wildcard/side-effect arms
+  // above cover `library()`/`source()`). The bare package name must not suffix-match the
+  // same-named `vendor/ggplot2.py`, whether or not a local package config exists.
+  it.each([
+    ['no package config', undefined],
+    [
+      'a package config that lists only other packages',
+      { packages: new Map([['pkgA', 'pkgA']]), namespaceInfoByPackageDir: new Map() },
+    ],
+  ])(
+    'R: a named importFrom() of an external package resolves to nothing (%s)',
+    (_label, config) => {
+      const testCase = CASES.get(SupportedLanguages.R)!;
+      const answer = SCOPE_RESOLVERS.get(SupportedLanguages.R)!.resolveImportTarget(
+        testCase.external,
+        testCase.fromFile,
+        new Set(testCase.files),
+        config,
+        {
+          parsedFiles: [],
+          parsedImport: {
+            kind: 'named',
+            localName: 'geom',
+            importedName: 'geom',
+            targetRaw: testCase.external,
+          },
+        },
+      );
+      expect(filesOf(answer)).toEqual([]);
+    },
+  );
 });

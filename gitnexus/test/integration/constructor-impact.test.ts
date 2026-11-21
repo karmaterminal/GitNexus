@@ -40,9 +40,22 @@ function memberCtorNodes(lang: string, cls: string, ctorName: string, path: stri
   ];
 }
 
+// A CALLS edge resolved by name alone (`global-name-fallback`) is a guess. The
+// depth walk omits those and reports the count; the constructor fold must too.
+const NAME_ONLY_SEED = [
+  `CREATE (c:Class {id:'js:class:Gizmo', name:'Gizmo', filePath:'src/js/gizmo.js', startLine:1, endLine:50, isExported:true, content:'', description:''})`,
+  `CREATE (m:Method {id:'js:ctor:Gizmo', name:'constructor', filePath:'src/js/gizmo.js', startLine:2, endLine:5, isExported:false, content:'', description:''})`,
+  `CREATE (f:Function {id:'js:fn:make', name:'make', filePath:'src/js/make', startLine:1, endLine:5, isExported:true, content:'', description:''})`,
+  `CREATE (f:Function {id:'js:fn:guess', name:'guess', filePath:'src/js/guess', startLine:1, endLine:5, isExported:true, content:'', description:''})`,
+  `MATCH (a:Class {id:'js:class:Gizmo'}), (b:Method {id:'js:ctor:Gizmo'}) CREATE (a)-[:CodeRelation {type:'HAS_METHOD', confidence:0.9, reason:'', step:0}]->(b)`,
+  `MATCH (a:Function {id:'js:fn:make'}), (b:Class {id:'js:class:Gizmo'}) CREATE (a)-[:CodeRelation {type:'CALLS', confidence:0.9, reason:'', step:0}]->(b)`,
+  `MATCH (a:Function {id:'js:fn:guess'}), (b:Class {id:'js:class:Gizmo'}) CREATE (a)-[:CodeRelation {type:'CALLS', confidence:0.9, reason:'global-name-fallback', step:0}]->(b)`,
+];
+
 const SEED = [
   ...memberCtorNodes('ts', 'Widget', 'constructor', 'src/ts/widget.ts'),
   ...memberCtorNodes('py', 'Gadget', '__init__', 'src/py/gadget.py'),
+  ...NAME_ONLY_SEED,
 ];
 
 const namesByDepth = (result: any): Record<string, string[]> =>
@@ -93,6 +106,19 @@ withTestLbugDB(
         });
       });
     }
+
+    describe('name-only class callers', () => {
+      it('counts them as omitted instead of folding them in', async () => {
+        const result = await backend.callTool('impact', {
+          target_uid: 'js:ctor:Gizmo',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(namesByDepth(result)).toEqual({ '1': ['make'] });
+        expect(result.omittedNameOnlyCalls).toBe(1);
+        expect(result.partial).toBe(true);
+      });
+    });
   },
   {
     seed: SEED,
