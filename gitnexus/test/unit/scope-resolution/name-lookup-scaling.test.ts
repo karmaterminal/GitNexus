@@ -259,6 +259,45 @@ describe('read-only name lookup navigation', () => {
     for (const depth of [24, 96]) expect(await measure(depth)).toBe(5 * depth + 1);
   });
 
+  it('keeps the lookup cache when the reference pass yields to the event loop', async () => {
+    // More sites than one cooperative-yield batch in resolve-references.ts, so
+    // the pass resumes from the event loop part-way. A cache installed only for
+    // the synchronous part would be gone for every site after the first yield.
+    const depth = 6_000;
+    const f = fixture(depth);
+    Object.assign(f.indexes, {
+      defs: buildDefIndex([]),
+      qualifiedNames: buildQualifiedNameIndex([]),
+      moduleScopes: buildModuleScopeIndex([{ filePath: 'test.dart', moduleScopeId: 'scope0' }]),
+      methodDispatch: buildMethodDispatchIndex({
+        owners: [],
+        computeMro: () => [],
+        implementsOf: () => [],
+      }),
+      referenceSites: f.scopes.slice(1).flatMap((scope) =>
+        (['call', 'read'] as const).map((kind) => ({
+          kind,
+          name: 'items',
+          inScope: scope.id,
+          filePath: scope.filePath,
+          atRange: scope.range,
+        })),
+      ),
+    });
+    let yielded = false;
+    setImmediate(() => {
+      yielded = true;
+    });
+    const result = await resolveReferenceSites({
+      scopes: f.indexes,
+      ownedMembersByOwner: () => [],
+    });
+    // A pass that never yielded would finish before this callback runs.
+    expect(yielded).toBe(true);
+    expect(result.stats.sitesProcessed).toBe(depth * 2);
+    expect(f.reads()).toBe(5 * depth + 1);
+  });
+
   it('scales linearly when every nested closure reads an outer binder', () => {
     const measure = (depth: number, run: Run) => {
       const f = fixture(depth);
