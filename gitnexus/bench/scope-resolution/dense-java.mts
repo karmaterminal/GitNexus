@@ -51,7 +51,7 @@ console.log(
   JSON.stringify({ files: files.length, counts, memory: process.memoryUsage() }),
 );
 const started = performance.now();
-runScopeResolution(
+await runScopeResolution(
   {
     graph: parsed.graph,
     model: parsed.model,

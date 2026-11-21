@@ -10,6 +10,7 @@ import { performance } from 'node:perf_hooks';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { summarize, formatReport } from './statistics.mjs';
+import { parityBody } from './integrity-parity.mjs';
 
 const { values } = parseArgs({
   options: {
@@ -60,15 +61,14 @@ const runtimes = Object.fromEntries(
   }),
 );
 const repo = path.join(out, 'repo');
-const index = path.join(out, 'index');
+/** Main heap (MiB) for building each 64-file fixture index. */
+const INDEX_HEAP_MB = '1024';
 const env = {
   PATH: process.env.PATH,
   HOME: process.env.HOME,
   LANG: 'C.UTF-8',
   TZ: 'UTC',
   ...(process.env.LD_LIBRARY_PATH ? { LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH } : {}),
-  GITNEXUS_HOME: path.join(out, 'home'),
-  GITNEXUS_STORAGE_PATH: index,
   GITNEXUS_SHARED_STORE: 'off',
   GITNEXUS_MEMORY: 'off',
   GITNEXUS_CONTENT_RETENTION: 'full',
@@ -76,6 +76,16 @@ const env = {
   GITNEXUS_MCP_READ_ONLY: '1',
   GITNEXUS_LBUG_EXTENSION_INSTALL: 'load-only',
 };
+const runtimeEnvs = Object.fromEntries(
+  ['baseline', 'candidate'].map((variant) => [
+    variant,
+    {
+      ...env,
+      GITNEXUS_HOME: path.join(out, 'home', variant),
+      GITNEXUS_STORAGE_PATH: path.join(out, 'index', variant),
+    },
+  ]),
+);
 const queries = [
   { name: 'small_source', symbol: 'lookupSmallSource', source: true },
   { name: 'small_metadata', symbol: 'lookupSmallSource', source: false },
@@ -109,7 +119,8 @@ function canonical(value) {
 }
 
 function inspect(response, entry, variant) {
-  assert(!response.isError, `MCP error in ${entry.name}`);
+  if (response.isError)
+    assert.fail(`MCP error in ${variant}/${entry.name}: ${JSON.stringify(response)}`);
   if (entry.tool === 'tools/list') {
     for (const name of ['query', 'context'])
       assert(
@@ -128,6 +139,12 @@ function inspect(response, entry, variant) {
     !body.error && !body.partial,
     `Incomplete ${variant}/${entry.name} response: ${JSON.stringify({ error: body.error, partial: body.partial, warning: body.warning })}`,
   );
+  // Separate builds have different receipt timestamps. Validate each against its
+  // own index before excluding that timestamp from cross-runtime parity.
+  if (body.staleness) {
+    assert.equal(body.staleness.indexedAt, report.indexes[variant].indexedAt);
+    delete body.staleness.indexedAt;
+  }
   const rows = entry.tool === 'query' ? [...body.process_symbols, ...body.definitions] : [];
   if (entry.tool === 'query') {
     if (entry.name === 'empty') assert.equal(rows.length, 0);
@@ -151,6 +168,7 @@ function inspect(response, entry, variant) {
   if (entry.tool === 'context') {
     assert(body.symbol?.content?.length > 4096, 'Context must preserve the indexed source snippet');
   }
+  const comparable = parityBody(body, variant, report.indexes);
   return {
     bytes: Buffer.byteLength(text),
     rows: rows.length,
@@ -159,8 +177,8 @@ function inspect(response, entry, variant) {
     digest: hash(
       JSON.stringify(
         entry.tool === 'context'
-          ? { ...canonical(body), content: body.symbol.content }
-          : canonical(body),
+          ? { ...canonical(comparable), content: body.symbol.content }
+          : canonical(comparable),
       ),
     ),
   };
@@ -185,7 +203,7 @@ async function open(variant, clients) {
     command: process.execPath,
     args: [runtimes[variant].cli, 'mcp'],
     cwd: repo,
-    env,
+    env: runtimeEnvs[variant],
     stderr: 'pipe',
   });
   const stderr = fs.createWriteStream(path.join(out, `${variant}.log`), { flags: 'a' });
@@ -235,7 +253,7 @@ const records = [],
 const report = {
   version: 1,
   harnessSha256: hash(
-    ['measure.mjs', 'statistics.mjs']
+    ['measure.mjs', 'statistics.mjs', 'integrity-parity.mjs']
       .map((file) => fs.readFileSync(new URL(file, import.meta.url), 'utf8'))
       .join('\n'),
   ),
@@ -288,22 +306,37 @@ try {
     execFileSync('git', args, { cwd: repo, env: gitEnv, stdio: 'pipe' });
   }
   report.fixtureSha256 = hash(JSON.stringify(source));
+  report.indexes = {};
   const log = fs.openSync(path.join(out, 'index.log'), 'wx');
   try {
-    execFileSync(process.execPath, [runtimes.candidate.cli, 'analyze', repo, '--index-only'], {
-      cwd: repo,
-      env,
-      stdio: ['ignore', log, log],
-    });
+    // Native storage formats can differ across engine upgrades. Each runtime
+    // builds its own index from the same fixture; response parity is checked below.
+    for (const variant of ['baseline', 'candidate']) {
+      const runtimeEnv = runtimeEnvs[variant];
+      fs.writeSync(log, `\n${variant} index (${runtimes[variant].sha})\n`);
+      // Indexing is setup, outside the timing window. Give it an explicit heap
+      // so admission does not depend on the runner's RAM or on the runtime's
+      // default heap policy: with GITNEXUS_MEMORY=off, a runtime that reserves
+      // V8's default limit refuses hosts reporting under about 15.8 GiB.
+      execFileSync(
+        process.execPath,
+        [runtimes[variant].cli, 'analyze', repo, '--index-only', '--memory-budget', INDEX_HEAP_MB],
+        { cwd: repo, env: runtimeEnv, stdio: ['ignore', log, log] },
+      );
+      const metadata = JSON.parse(
+        fs.readFileSync(path.join(runtimeEnv.GITNEXUS_STORAGE_PATH, 'gitnexus.json'), 'utf8'),
+      );
+      report.indexes[variant] = metadata;
+      assert(
+        metadata.stats.nodes >= 128 && metadata.stats.files === 64,
+        `Incomplete ${variant} fixture index`,
+      );
+      assert.equal(metadata.stats.embeddings ?? 0, 0, 'Benchmark must not generate embeddings');
+    }
   } finally {
     fs.closeSync(log);
   }
-  report.index = JSON.parse(fs.readFileSync(path.join(index, 'gitnexus.json'), 'utf8'));
-  assert(
-    report.index.stats.nodes >= 128 && report.index.stats.files === 64,
-    'Incomplete fixture index',
-  );
-  assert.equal(report.index.stats.embeddings ?? 0, 0, 'Benchmark must not generate embeddings');
+  report.index = report.indexes.candidate; // Preserve the existing report field.
   for (let session = 0; session < sessions; session++) {
     const clients = {};
     try {

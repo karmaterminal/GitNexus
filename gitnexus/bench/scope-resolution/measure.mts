@@ -60,7 +60,7 @@ async function sample(language: SupportedLanguages, count: number, methods: numb
     let moduleTypeBindings = 0;
     let typeBindings = 0;
     const resolveStarted = performance.now();
-    runScopeResolution(
+    await runScopeResolution(
       {
         graph,
         model,

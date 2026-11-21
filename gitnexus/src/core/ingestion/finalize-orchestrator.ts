@@ -48,6 +48,8 @@ import {
   buildModuleScopeIndex,
   buildQualifiedNameIndex,
   buildScopeTree,
+  createEagerImportVisibility,
+  createGroupedImportVisibility,
   finalize,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
@@ -158,7 +160,12 @@ export function finalizeScopeModel(
     qualifiedNames,
     moduleScopes,
     methodDispatch,
-    imports: finalizeOut.imports,
+    // Finalize reports `importEntries` only when it stored an import as a
+    // group; every other run keeps one edge per imported file.
+    imports:
+      finalizeOut.importEntries === undefined
+        ? createEagerImportVisibility(finalizeOut.imports)
+        : createGroupedImportVisibility(finalizeOut.importEntries, finalizeOut.imports),
     bindings: finalizeOut.bindings,
     // Empty post-finalize augmentation channel. Populated (if at all)
     // by language hooks like `populateCsharpNamespaceSiblings` running
@@ -233,12 +240,15 @@ function withDefaultHooks(partial: Partial<FinalizeHooks>): FinalizeHooks {
   return {
     ownedMembersBindAtModuleScope: partial.ownedMembersBindAtModuleScope,
     importsBindAtLexicalScope: partial.importsBindAtLexicalScope === true,
+    groupsWildcardTargets: partial.groupsWildcardTargets === true,
     resolveImportTarget: partial.resolveImportTarget ?? (() => null),
     isNamespaceImport: partial.isNamespaceImport,
     wildcardCollisionIsAmbiguous: partial.wildcardCollisionIsAmbiguous === true,
     namedImportsBindTopLevelOnly: partial.namedImportsBindTopLevelOnly === true,
+    wildcardReexportExcludedNames: partial.wildcardReexportExcludedNames,
     expandsWildcardTo: partial.expandsWildcardTo ?? (() => []),
     filterWildcardNames: partial.filterWildcardNames,
+    mergeBindingsAreAssociative: partial.mergeBindingsAreAssociative,
     mergeBindings:
       partial.mergeBindings ??
       ((

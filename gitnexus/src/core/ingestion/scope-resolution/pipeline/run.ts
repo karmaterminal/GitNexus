@@ -24,6 +24,7 @@
  */
 
 import type {
+  CallResultAssignmentSite,
   ParsedFile,
   ReferenceSite,
   RegistryProviders,
@@ -32,6 +33,7 @@ import type {
 } from 'gitnexus-shared';
 import type { TypeRef } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import { GraphReferenceIntegrityError } from '../../../graph/relationship-integrity.js';
 import { generateId } from '../../../../lib/utils.js';
 import { lookupOwnedMembersByOwner } from '../../model/owned-members-lookup.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
@@ -124,16 +126,65 @@ import {
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
 import { narrowOverloadCandidates } from '../passes/overload-narrowing.js';
 import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
-import { withdrawAnsweredReceiverDrops } from '../resolution-outcome.js';
+import { answeredSiteKey, withdrawAnsweredReceiverDrops } from '../resolution-outcome.js';
 import { isDebugHeapEnabled, logHeapProbe } from '../../utils/heap-probe.js';
 import { parseTruthyEnv } from '../../utils/env.js';
+import { callResultBindingKey, selectedCallKey } from '../passes/provider-call-outcome.js';
+
+function setCallResultBinding(scope: Scope, name: string, returned: TypeRef | undefined): boolean {
+  const bindings = scope.typeBindings as Map<string, TypeRef>;
+  if (returned === undefined) return bindings.delete(name);
+  const binding: TypeRef = {
+    rawName: returned.rawName,
+    ...(returned.declaredSpelling !== undefined
+      ? { declaredSpelling: returned.declaredSpelling }
+      : {}),
+    declaredAtScope: returned.declaredAtScope,
+    ...(returned.lookupPosition !== undefined ? { lookupPosition: returned.lookupPosition } : {}),
+    source: 'assignment-inferred',
+  };
+  const previous = bindings.get(name);
+  if (
+    previous?.rawName === binding.rawName &&
+    previous.declaredSpelling === binding.declaredSpelling &&
+    previous.declaredAtScope === binding.declaredAtScope &&
+    previous.source === binding.source &&
+    previous.lookupPosition?.startLine === binding.lookupPosition?.startLine &&
+    previous.lookupPosition?.startCol === binding.lookupPosition?.startCol
+  )
+    return false;
+  bindings.set(name, binding);
+  return true;
+}
+
+function applySelectedCallResultBinding(
+  assignment: CallResultAssignmentSite,
+  indexes: ScopeResolutionIndexes,
+  workspaceIndex: ReturnType<typeof buildWorkspaceResolutionIndex>,
+  selected: SymbolDefinition | null | undefined,
+  elementType?: ScopeResolver['callResultElementType'],
+): boolean {
+  const scope = indexes.scopeTree.getScope(assignment.inScope);
+  if (scope === undefined) return false;
+  const returned =
+    selected == null
+      ? undefined
+      : workspaceIndex.declaredReturnTypeByCallableId.get(selected.nodeId);
+  // An element of the result is typed only by the provider's route answer.
+  const bound =
+    selected == null || returned === undefined || assignment.element === undefined
+      ? returned
+      : elementType?.(selected, returned, assignment.element, indexes);
+  return setCallResultBinding(scope, assignment.lhs, bound);
+}
 
 /**
  * Join extraction-time assignment identity to Phase-4's exact resolved callee.
  * Ambiguous dispatch and missing return annotations deliberately produce no
  * binding. Extraction emits these facts only for untyped declarations, so an
  * existing entry here is necessarily inference/mirroring and may be corrected;
- * explicit annotations never enter this join.
+ * explicit annotations never enter this join. A site in `refused` (see
+ * `ScopeResolver.callResultAssignmentApplies`) is left out entirely.
  */
 export function applyPreciseCallResultBindings(
   parsedFiles: readonly ParsedFile[],
@@ -143,8 +194,27 @@ export function applyPreciseCallResultBindings(
   nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
   model: SemanticModel,
   requireOwnedHoistedReturn = false,
+  selectedCalls?: ReadonlyMap<string, SymbolDefinition | null>,
+  refused?: ReadonlySet<CallResultAssignmentSite>,
 ): number {
   let updated = 0;
+  if (selectedCalls !== undefined) {
+    for (const parsed of parsedFiles) {
+      for (const assignment of parsed.callResultAssignmentSites ?? []) {
+        if (refused?.has(assignment) === true) continue;
+        if (
+          applySelectedCallResultBinding(
+            assignment,
+            indexes,
+            workspaceIndex,
+            selectedCalls.get(selectedCallKey(parsed.filePath, assignment.callSite)),
+          )
+        )
+          updated++;
+      }
+    }
+    return updated;
+  }
   const returnTypeByGraphId = new Map<string, { type: TypeRef; def: SymbolDefinition }>();
   for (const parsed of parsedFiles) {
     for (const def of parsed.localDefs) {
@@ -167,13 +237,16 @@ export function applyPreciseCallResultBindings(
       }
     }
     for (const assignment of parsed.callResultAssignmentSites ?? []) {
+      // An element route needs the exact selected callee; see above.
+      if (assignment.element !== undefined || refused?.has(assignment) === true) continue;
+      const scope = indexes.scopeTree.getScope(assignment.inScope);
+      if (scope === undefined) continue;
       const targets = resolvedByPosition.get(
         calleeIdPosKey(assignment.callSite.startLine, assignment.callSite.startCol),
       );
-      if (targets === undefined || targets.size !== 1) continue;
-      const targetId = targets.values().next().value as string | undefined;
-      if (targetId === undefined) continue;
-      const returned = returnTypeByGraphId.get(targetId);
+      const targetId =
+        targets?.size === 1 ? (targets.values().next().value as string | undefined) : undefined;
+      const returned = targetId === undefined ? undefined : returnTypeByGraphId.get(targetId);
       if (returned === undefined) continue;
       if (requireOwnedHoistedReturn) {
         const site = callsByPosition?.get(
@@ -225,18 +298,14 @@ export function applyPreciseCallResultBindings(
         )
           continue;
       }
-      const returnType = returned.type;
-      const scope = indexes.scopeTree.getScope(assignment.inScope);
-      if (scope === undefined) continue;
-      (scope.typeBindings as Map<string, TypeRef>).set(assignment.lhs, {
-        rawName: returnType.rawName,
-        ...(returnType.declaredSpelling !== undefined
-          ? { declaredSpelling: returnType.declaredSpelling }
-          : {}),
-        declaredAtScope: assignment.inScope,
-        source: 'assignment-inferred',
-      });
-      updated++;
+      if (
+        setCallResultBinding(scope, assignment.lhs, {
+          ...returned.type,
+          declaredAtScope: assignment.inScope,
+          lookupPosition: undefined,
+        })
+      )
+        updated++;
     }
   }
   return updated;
@@ -258,8 +327,8 @@ const SCOPE_YIELD_BATCH_FILES = 256;
  *     graph (so this pass is a no-op when the legacy path already emitted it).
  *   - `seen` — per-site key shared with the generic edge bridge so the two
  *     passes never double-emit the same resolution.
- * The `dedupKey` and `rel:` id shape match `tryEmitEdge` exactly, so graph
- * output stays byte-identical. The caller is the enclosing class (NOT the
+ * This prepass retains its point-only identity; unlike full spans emitted by
+ * `tryEmitEdge`, it cannot certify source-site distinctness. The caller is the enclosing class (NOT the
  * method/constructor `resolveCallerGraphId` would prefer — that broke MRO for
  * C# 12 primary constructors, #1951); the edge type is pre-discriminated.
  */
@@ -543,7 +612,10 @@ interface RunScopeResolutionInput {
    * `ParsedFile[]` to mirror the pipeline shape.
    */
   readonly model: MutableSemanticModel;
-  readonly files: readonly { readonly path: string; readonly content: string }[];
+  readonly files: readonly {
+    readonly path: string;
+    readonly content: string;
+  }[];
   readonly onWarn?: (message: string) => void;
   /**
    * Optional pre-parsed-Tree lookup keyed by file path: a cache hit lets the
@@ -1015,6 +1087,11 @@ export async function runScopeResolution(
     hooks: {
       ownedMembersBindAtModuleScope: provider.ownedMembersBindAtModuleScope,
       importsBindAtLexicalScope: provider.importsBindAtLexicalScope === true,
+      // `GITNEXUS_DISABLE_IMPORT_GROUPS=1` restores one edge per imported file,
+      // for comparing the two storage forms on the same build.
+      groupsWildcardTargets:
+        provider.groupsWildcardImportTargets === true &&
+        !parseTruthyEnv(process.env.GITNEXUS_DISABLE_IMPORT_GROUPS),
       resolveImportTarget: (targetRaw, fromFile, _workspaceIndex, parsedImport) =>
         provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig, {
           parsedFiles,
@@ -1031,10 +1108,15 @@ export async function runScopeResolution(
               filterWildcardNames(targetModuleScope, names, parsedFiles),
       mergeBindings: (existing, incoming, scopeId) =>
         provider.mergeBindings(existing, incoming, scopeId),
+      mergeBindingsAreAssociative: provider.mergeBindingsAreAssociative,
       wildcardCollisionIsAmbiguous: provider.exclusiveWildcardReexports === true,
       namedImportsBindTopLevelOnly: provider.namedImportsBindTopLevelOnly === true,
+      wildcardReexportExcludedNames: provider.wildcardReexportExcludedNames,
     },
   });
+  // Import-visible namespaces are bindings: publish them before the first pass
+  // that reads one (inheritance resolution below).
+  provider.populateImportNamespaces?.(parsedFiles, finalized);
   if (referenceBindings !== undefined) {
     for (const site of finalized.referenceSites)
       referenceBindings.set(site, {
@@ -1134,17 +1216,6 @@ export async function runScopeResolution(
     postHeritageNodeLookup,
   );
 
-  // Replace the empty MethodDispatchIndex that finalizeScopeModel
-  // builds by design with the populated one derived from the
-  // language's MRO. Spread produces a fresh `ScopeResolutionIndexes`
-  // instead of mutating the finalized result through an `as` cast —
-  // downstream passes get an object whose readonly guarantees match
-  // the type system.
-  const indexes = {
-    ...finalized,
-    methodDispatch: buildPopulatedMethodDispatch(mroByClassDefId, extendsOnlyMroByClassDefId),
-  };
-
   // Build the workspace resolution index ONCE — scope-valued lookups
   // (`classScopeByDefId`, `moduleScopeByFile`) that `SemanticModel`
   // cannot carry. Must run AFTER `populateOwners` (so owned defs are
@@ -1154,10 +1225,29 @@ export async function runScopeResolution(
   // views that delegate to it (out-of-core scope index) — the index pins no Scope objects, so the
   // disk seal can reclaim them. Byte-identical: the view returns the same Scope
   // the resident tree holds (or a value-identical revived one in disk mode).
-  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles, indexes.scopeTree, {
+  const methodDispatch = buildPopulatedMethodDispatch(mroByClassDefId, extendsOnlyMroByClassDefId);
+  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles, finalized.scopeTree, {
     stripTypePreservingDecoration: provider.stripTypePreservingDecoration,
+    namespaceExports: provider.namespaceExportsFromModuleExports
+      ? provider.moduleExports
+      : undefined,
   });
   logHeapProbe('sr-post-workspaceIndex', `lang=${provider.language}`);
+
+  // Replace the empty MethodDispatchIndex that finalizeScopeModel
+  // builds by design with the populated one derived from the
+  // language's MRO, and install the provider's namespace exports. Spread
+  // produces a fresh `ScopeResolutionIndexes` instead of mutating the
+  // finalized result through an `as` cast — every member is written here,
+  // once, and downstream passes get an object whose readonly guarantees
+  // match the type system.
+  const indexes: ScopeResolutionIndexes = {
+    ...finalized,
+    methodDispatch,
+    ...(workspaceIndex.namespaceExportsByFile === undefined
+      ? {}
+      : { namespaceExportsByFile: workspaceIndex.namespaceExportsByFile }),
+  };
 
   // Complete implicit namespace visibility and refine provider-owned type facts
   // before return propagation. New bindings use bindingAugmentations; existing
@@ -1191,6 +1281,10 @@ export async function runScopeResolution(
       workspaceIndex,
       provider.resolveQualifiedCallee,
       allFilePaths,
+      provider.elementTypeOf,
+      provider.followsInstanceCallResultTypes === true
+        ? (owner, name) => input.model.methods.lookupAllByOwner(owner, name)
+        : undefined,
     );
   }
 
@@ -1216,6 +1310,71 @@ export async function runScopeResolution(
   if (provider.emitPostResolutionEdges === undefined) {
     fileContents?.clear();
     fileContents = undefined;
+  }
+
+  // Decided once, before any call-result binding is cleared or applied.
+  const refusedCallResultSites = new Set<CallResultAssignmentSite>();
+  const callResultAssignmentApplies = provider.callResultAssignmentApplies;
+  if (callResultAssignmentApplies !== undefined) {
+    for (const parsed of parsedFiles) {
+      for (const assignment of parsed.callResultAssignmentSites ?? []) {
+        if (!callResultAssignmentApplies(assignment, indexes))
+          refusedCallResultSites.add(assignment);
+      }
+    }
+  }
+
+  const selectedCalls =
+    provider.receiverCallSite === undefined
+      ? undefined
+      : new Map<string, SymbolDefinition | null>();
+  const pendingCallReceivers = selectedCalls === undefined ? undefined : new Map<string, string>();
+  const callResultProducers =
+    selectedCalls === undefined ? undefined : new Map<string, CallResultAssignmentSite>();
+  const assignmentsByProducer = new Map<string, CallResultAssignmentSite[]>();
+  if (callResultProducers !== undefined) {
+    for (const parsed of parsedFiles) {
+      for (const assignment of parsed.callResultAssignmentSites ?? []) {
+        if (refusedCallResultSites.has(assignment)) continue;
+        callResultProducers.set(
+          callResultBindingKey(assignment.inScope, assignment.lhs),
+          assignment,
+        );
+        const key = selectedCallKey(parsed.filePath, assignment.callSite);
+        let assignments = assignmentsByProducer.get(key);
+        if (assignments === undefined) assignmentsByProducer.set(key, (assignments = []));
+        assignments.push(assignment);
+      }
+    }
+  }
+  const onSelectedCall =
+    selectedCalls === undefined
+      ? undefined
+      : (key: string, definition: SymbolDefinition | null): void => {
+          for (const assignment of assignmentsByProducer.get(key) ?? []) {
+            applySelectedCallResultBinding(
+              assignment,
+              indexes,
+              workspaceIndex,
+              definition,
+              provider.callResultElementType,
+            );
+          }
+        };
+  if (!callableFlowOnly && selectedCalls !== undefined) {
+    // Clear guessed assignment returns before Registry.lookup can cache a
+    // wrong downstream member. Exact primaries restore them after emission.
+    applyPreciseCallResultBindings(
+      parsedFiles,
+      indexes,
+      workspaceIndex,
+      createCalleeIdAccumulator(),
+      postHeritageNodeLookup,
+      readonlyModel,
+      provider.hoistedTypeBindingsRequireOwner === true,
+      selectedCalls,
+      refusedCallResultSites,
+    );
   }
   await yieldToEventLoop();
 
@@ -1390,7 +1549,10 @@ export async function runScopeResolution(
   // propagation. Populated below at every CALLS emit path before dedup; the CFG
   // join still consumes it only inside the `input.pdg` block.
   const calleeIdAccumulator: CalleeIdAccumulator | undefined =
-    input.pdg === true || deferredIndirectSites.size > 0 || callResultAssignmentSites.size > 0
+    input.pdg === true ||
+    deferredIndirectSites.size > 0 ||
+    callResultAssignmentSites.size > 0 ||
+    provider.receiverCallSite !== undefined
       ? createCalleeIdAccumulator(
           input.pdg === true
             ? undefined
@@ -1418,6 +1580,10 @@ export async function runScopeResolution(
         {
           recordResolutionOutcome,
           recordSourceBinding,
+          selectedCalls,
+          onSelectedCall,
+          pendingCallReceivers,
+          callResultProducers,
           allFilePaths,
           calleeIdSink: calleeIdAccumulator,
           // The pass's sources of positive EXTERNAL evidence for a dropped
@@ -1485,6 +1651,7 @@ export async function runScopeResolution(
               : undefined,
           constructorCallTargetsClass: provider.constructorCallTargetsClass === true,
           markConstructionSites: provider.markConstructionSites === true,
+          bareCallConstructs: provider.constructionSyntax?.bare === true,
           isFileLocalDef: provider.isFileLocalDef,
           isBuiltInName: provider.languageProvider.isBuiltInName,
           freeCallsRequireInstanceOwnership: provider.freeCallsRequireInstanceOwnership === true,
@@ -1494,6 +1661,10 @@ export async function runScopeResolution(
           resolveAdlCandidates: provider.resolveAdlCandidates,
           resolveOrdinaryCallables: provider.resolveOrdinaryCallables,
           resolveQualifiedFreeCall: provider.resolveQualifiedFreeCall,
+          qualifiedFreeCallOutranksNameClaim: provider.qualifiedFreeCallOutranksNameClaim,
+          resolveUnqualifiedCall: provider.resolveUnqualifiedCall,
+          selectedCalls,
+          onSelectedCall,
           conversionRankFn: provider.conversionRankFn,
           conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
           constraintCompatibility: provider.constraintCompatibility,
@@ -1506,7 +1677,7 @@ export async function runScopeResolution(
   probeEmit('free-calls-end', `handled=${handledSites.size} emitted=${freeCallExtras}`);
   await yieldToEventLoop();
   const replayedCallResultBindings =
-    callableFlowOnly || calleeIdAccumulator === undefined
+    callableFlowOnly || calleeIdAccumulator === undefined || selectedCalls !== undefined
       ? 0
       : applyPreciseCallResultBindings(
           emitParsedFiles,
@@ -1516,8 +1687,10 @@ export async function runScopeResolution(
           postHeritageNodeLookup,
           readonlyModel,
           provider.hoistedTypeBindingsRequireOwner === true,
+          selectedCalls,
+          refusedCallResultSites,
         );
-  if (replayedCallResultBindings > 0) {
+  if (replayedCallResultBindings > 0 || selectedCalls !== undefined) {
     const handledBeforeReplay = new Set(handledSites);
     const replayedReceiverBound = await emitReceiverBoundCalls(
       graph,
@@ -1531,6 +1704,11 @@ export async function runScopeResolution(
       {
         calleeIdSink: calleeIdAccumulator,
         recordSourceBinding,
+        recordResolutionOutcome: selectedCalls === undefined ? undefined : recordResolutionOutcome,
+        selectedCalls,
+        onSelectedCall,
+        pendingCallReceivers,
+        callResultProducers,
         isBuiltInName: provider.languageProvider.isBuiltInName,
         externalReceiverNames: provider.languageProvider.externalReceiverNames,
         isExternalModuleSpecifier: provider.languageProvider.isExternalModuleSpecifier,
@@ -1556,18 +1734,41 @@ export async function runScopeResolution(
     for (const key of handledSites) {
       if (!handledBeforeReplay.has(key)) resolvedOnReplay.add(key);
     }
-    if (resolvedOnReplay.size > 0) {
-      for (let i = resolutionOutcomes.length - 1; i >= 0; i--) {
-        const outcome = resolutionOutcomes[i];
-        if (
-          outcome.kind === 'suppressed' &&
-          outcome.reason === 'receiver-unresolved' &&
-          resolvedOnReplay.has(callableFlowSiteKey(outcome.filePath, outcome.range))
-        ) {
-          resolutionOutcomes.splice(i, 1);
+    if (resolvedOnReplay.size > 0 || selectedCalls !== undefined) {
+      // Replay can retry an unresolved site. Keep its latest diagnostic once,
+      // and compact in one pass so withdrawing many drops stays linear.
+      const receiverDropPositions = new Map<string, number>();
+      let kept = 0;
+      for (const outcome of resolutionOutcomes) {
+        if (outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved') {
+          const resolved =
+            selectedCalls === undefined
+              ? resolvedOnReplay.has(callableFlowSiteKey(outcome.filePath, outcome.range))
+              : selectedCalls.get(selectedCallKey(outcome.filePath, outcome.range)) != null;
+          if (resolved) continue;
+          if (outcome.siteKind !== undefined) {
+            const key = answeredSiteKey(
+              outcome.filePath,
+              outcome.range,
+              outcome.siteKind,
+              outcome.name,
+            );
+            const previous = receiverDropPositions.get(key);
+            if (previous !== undefined) {
+              resolutionOutcomes[previous] = outcome;
+              continue;
+            }
+            receiverDropPositions.set(key, kept);
+          }
         }
+        resolutionOutcomes[kept++] = outcome;
       }
+      resolutionOutcomes.length = kept;
     }
+  }
+  for (const [key, handledKey] of pendingCallReceivers ?? []) {
+    selectedCalls?.set(key, null);
+    handledSites.add(handledKey);
   }
   // Receiver/free-call passes have finished reading this set. Extend it for
   // the remaining passes instead of retaining three whole-program copies.
@@ -1687,7 +1888,12 @@ export async function runScopeResolution(
   // propagation. `graph.addRelationship` remains first-write-wins, so precise
   // edges already emitted for a site retain ownership.
   const propertyDispatch = callableFlowOnly
-    ? { usesEmitted: 0, callsEmitted: 0, skippedKeys: 0, skippedKeyNames: [] as readonly string[] }
+    ? {
+        usesEmitted: 0,
+        callsEmitted: 0,
+        skippedKeys: 0,
+        skippedKeyNames: [] as readonly string[],
+      }
     : emitPropertyDispatchCalls(
         graph,
         indexes,
@@ -1752,9 +1958,25 @@ export async function runScopeResolution(
             ),
         });
   probeEmit('callable-flow-end', `iterations=${callableValueFlow.iterations}`);
+  const onDemandImportTargets = provider.onDemandImportTargets;
+  const importSources =
+    onDemandImportTargets === undefined
+      ? undefined
+      : new Map(emitParsedFiles.map((parsed) => [parsed.filePath, parsed]));
   const importsEmitted = callableFlowOnly
     ? 0
-    : emitImportEdges(graph, indexes.imports, indexes.scopeTree, provider.importEdgeReason);
+    : emitImportEdges(
+        graph,
+        indexes.imports,
+        indexes.scopeTree,
+        provider.importEdgeReason,
+        onDemandImportTargets === undefined
+          ? undefined
+          : (sourceFile) => {
+              const parsed = importSources?.get(sourceFile);
+              return parsed === undefined ? undefined : onDemandImportTargets(parsed, indexes);
+            },
+      );
   probeEmit('imports-end', `emitted=${importsEmitted}`);
 
   // Language-specific supplementary edges (e.g. Vue template-derived
@@ -2068,6 +2290,7 @@ export async function runScopeResolution(
           }
         }
       } catch (err) {
+        if (err instanceof GraphReferenceIntegrityError) throw err;
         // Last-resort isolation, mirroring the worker-side per-file try/catch:
         // a shape the predicate misses must cost this one file's CFG, not
         // abort the language's whole scope-resolution pass mid-graph-build.
@@ -2199,7 +2422,11 @@ export async function runScopeResolution(
   logHeapProbe('sr-end', `lang=${provider.language} parsedFiles=${parsedFiles.length}`);
 
   for (const outcome of resolutionOutcomes) input.recordResolutionOutcome?.(outcome);
-  input.onResolved?.({ parsedFiles, indexes, referenceBindings: referenceBindings! });
+  input.onResolved?.({
+    parsedFiles,
+    indexes,
+    referenceBindings: referenceBindings!,
+  });
 
   return {
     filesProcessed: parsedFiles.length,

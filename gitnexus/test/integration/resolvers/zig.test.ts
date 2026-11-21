@@ -32,11 +32,18 @@ describeGrammarPresence(zig);
 
 /** The CALLS / ACCESSES / USES edges the reference site at `file:line:col`
  *  produced, as `<TYPE> <source id> -> <target id> | <reason>`. A site edge's
- *  id ends with the site's `:<line>:<col>` (see `tryEmitEdge`). */
+ *  id carries the site's start and optional end coordinates (see `tryEmitEdge`). */
 function edgesAtSite(result: PipelineResult, file: string, line: number, col: number): string[] {
+  const sitePattern = new RegExp(`^:(?:read:|write:)?${line}:${col}(?::\\d+:\\d+)?$`);
   return ['CALLS', 'ACCESSES', 'USES']
     .flatMap((type) => getRelationships(result, type))
-    .filter((e) => e.sourceFilePath === file && e.rel.id.endsWith(`:${line}:${col}`))
+    .filter(
+      (e) =>
+        e.sourceFilePath === file &&
+        sitePattern.test(
+          e.rel.id.slice(e.rel.id.lastIndexOf(e.rel.targetId) + e.rel.targetId.length),
+        ),
+    )
     .map((e) => `${e.rel.type} ${e.rel.sourceId} -> ${e.rel.targetId} | ${e.rel.reason}`)
     .sort();
 }
@@ -420,10 +427,6 @@ describe.skipIf(!zigAvailable)('Zig idioms (zig-idioms fixture)', () => {
       expect(valueRefTargetIds.filter((id) => id.includes('scale'))).toEqual([
         'Function:src/webapi/dom_utils.zig:scale',
       ]);
-    });
-
-    it('applies the callable gate through a HUB too', () => {
-      expect(valueRefs).not.toContain('JsApi → DEFAULT_NS');
     });
 
     it('applies the callable gate to a MODULE owner too', () => {

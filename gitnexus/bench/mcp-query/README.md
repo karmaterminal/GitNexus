@@ -29,10 +29,14 @@ candidate. Without `--check`, `--sessions 1 --rounds 1` is a smoke run and canno
 establish a performance verdict. For an identical-code control, point both roots
 at the same build. Do not discard slow samples or rerun until a check turns green.
 
-The candidate indexes one fixed generated repository containing 32 short and 32
-oversized TypeScript functions. Both servers read that same index. Index creation
-is outside the timing window. Schemas must be compatible; an incompatible base
-fails explicitly. Corpus generation and dependency installation use no model.
+Both runtimes index the same fixed generated repository containing 32 short and
+32 oversized TypeScript functions. Each server uses its own index and registry,
+so engine upgrades can compare different native storage formats. Index creation
+is outside the timing window and runs with an explicit `--memory-budget` of
+1024 MiB, so it does not depend on the host's RAM. Both indexes must be complete and their responses
+must pass the parity checks below. The report retains both indexes' metadata in
+`indexes`; `index` remains the candidate metadata for existing report consumers.
+Corpus generation and dependency installation use no model.
 
 Eight fresh server pairs each run a warmup cycle and five measured rounds.
 Request order alternates between baseline and candidate. Workloads cover small
@@ -44,7 +48,12 @@ first query are recorded separately. Filesystem caches are not flushed.
 
 - Response identities, order and diagnostics must agree; timing, guidance and
   source representation are excluded from query equality. Indexed context source
-  must agree. At least ten known matches must survive each nonempty query.
+  must agree. Each staleness receipt timestamp must match its own index metadata;
+  only that timestamp is excluded from cross-runtime staleness equality. At least
+  ten known matches must survive each nonempty query.
+- When the baseline index predates relationship integrity receipts, the candidate
+  receipt must exactly match its own index metadata before that field is removed
+  for parity. When both indexes have receipts, they remain in the comparison.
 - Candidate query source cannot exceed 16,000 Unicode characters, cannot disappear
   entirely, and large previews must announce truncation. Context must retain the
   original indexed snippet (the indexer separately caps long function snippets).
