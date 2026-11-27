@@ -1,5 +1,7 @@
 # WORKORDER — gitnexus large-repo support remediation
 
+> **Status (2026-11-27): done, kept as history; these are not live instructions.** This workorder was carried out in 3c1e686ed (2026-05-29, on `frond`): scope resolution yields cooperatively, and that commit records an openclaw analyze that completed in 778 s on lothric. Its branch is no longer on `origin`, and `karmaterminal/GitNexus#1` now names a different issue (Tree-sitter 0.25 upgrade readiness, opened 2026-05-30). Still open at openclaw scale: #4 (the deferred resolve band takes 4 h 11 m, single-threaded and log-silent) and #5 (an incremental refresh SIGSEGVs in DB writeback).
+
 **Anchoring issue**: karmaterminal/GitNexus#1
 **Branch**: silas/gitnexus-large-repo-support-20260529 (already pushed to origin)
 **Worktree**: /tmp/silas-gitnexus-large-repo (on lothric)
